@@ -19,7 +19,7 @@ app.get('/', (req, res) => {
 const port = process.env.PORT || 9000;
 
 let rooms = {};
-const LOBBY_WAIT_TIME = 180; // 3 minutes in seconds
+const LOBBY_WAIT_TIME = 180; // 180 ثانية (3 دقائق)
 
 io.on('connection', (socket) => {
     console.log('Player connected:', socket.id);
@@ -96,8 +96,7 @@ function broadcastLobbyState(roomId) {
         playersCount: room.players.length,
         maxPlayers: 10,
         players: playersList,
-        countdown: room.countdown,
-        message: `Waiting for players... Starting in ${room.countdown}s`
+        countdown: room.countdown
     });
 }
 
@@ -110,6 +109,7 @@ function startGame(roomId) {
     const realPlayersCount = room.players.length;
     const botsCount = Math.max(0, maxPlayers - realPlayersCount);
 
+    // اختيار أول لاعب كـ Host والأبواق الأخرى كـ Guest
     room.players.forEach((p, index) => {
         p.socket.emit('matchFound', {
             role: index === 0 ? 'host' : 'guest',
@@ -120,7 +120,7 @@ function startGame(roomId) {
         });
     });
 
-    console.log(`Game started in room ${roomId} with ${realPlayersCount} players and ${botsCount} bots.`);
+    console.log(`Game started in room ${roomId} with ${realPlayersCount} players.`);
 }
 
 function leaveRoom(socket) {
