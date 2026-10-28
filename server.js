@@ -18,7 +18,7 @@ app.get('/', (req, res) => {
 
 const port = process.env.PORT || 9000;
 let rooms = {};
-const LOBBY_WAIT_TIME = 180; // 3 minutes
+const LOBBY_WAIT_TIME = 30; // 3 minutes
 
 io.on('connection', (socket) => {
     socket.on('findMatch', (data) => {
