@@ -13,17 +13,14 @@ app.get('/ping', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.send('Street War Server is Running!');
+    res.send('Street War Server Running');
 });
 
 const port = process.env.PORT || 9000;
-
 let rooms = {};
-const LOBBY_WAIT_TIME = 180; // 180 ثانية (3 دقائق)
+const LOBBY_WAIT_TIME = 180; // 3 minutes
 
 io.on('connection', (socket) => {
-    console.log('Player connected:', socket.id);
-
     socket.on('findMatch', (data) => {
         const mode = data.mode || 'br';
         socket.gameMode = mode;
@@ -61,7 +58,6 @@ io.on('connection', (socket) => {
         if (!room.timer) {
             room.timer = setInterval(() => {
                 room.countdown--;
-
                 if (room.countdown <= 0 || room.players.length >= 10) {
                     clearInterval(room.timer);
                     startGame(roomId);
@@ -82,14 +78,12 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         leaveRoom(socket);
-        console.log('Player disconnected:', socket.id);
     });
 });
 
 function broadcastLobbyState(roomId) {
     const room = rooms[roomId];
     if (!room) return;
-
     const playersList = room.players.map(p => ({ id: p.id, name: p.name }));
     io.to(roomId).emit('lobbyUpdate', {
         roomId: roomId,
@@ -109,7 +103,6 @@ function startGame(roomId) {
     const realPlayersCount = room.players.length;
     const botsCount = Math.max(0, maxPlayers - realPlayersCount);
 
-    // اختيار أول لاعب كـ Host والأبواق الأخرى كـ Guest
     room.players.forEach((p, index) => {
         p.socket.emit('matchFound', {
             role: index === 0 ? 'host' : 'guest',
@@ -119,8 +112,6 @@ function startGame(roomId) {
             totalPlayers: realPlayersCount
         });
     });
-
-    console.log(`Game started in room ${roomId} with ${realPlayersCount} players.`);
 }
 
 function leaveRoom(socket) {
