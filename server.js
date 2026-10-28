@@ -8,14 +8,19 @@ const io = new Server(server, {
     cors: { origin: "*" }
 });
 
-const port = process.env.PORT || 9000;
-
-let queues = { br: [], dm: [], ctf: [] };
-let matchmakingTimers = {};
+// مسار فحص للرد على UptimeRobot وإبقاء السيرفر مستيقظاً
+app.get('/ping', (req, res) => {
+    res.status(200).send('Server is active');
+});
 
 app.get('/', (req, res) => {
     res.send('Street War Server is Running!');
 });
+
+const port = process.env.PORT || 9000;
+
+let queues = { br: [], dm: [], ctf: [] };
+let matchmakingTimers = {};
 
 io.on('connection', (socket) => {
     console.log('لاعب متصل:', socket.id);
@@ -27,7 +32,7 @@ io.on('connection', (socket) => {
 
         if (!queues[mode]) queues[mode] = [];
         
-        // إزالة اللاعب إذا كان موجوداً سابقاً لتجنب التكرار
+        // إزالة أي تسجيل سابق لنفس اللاعب
         queues[mode] = queues[mode].filter(s => s.id !== socket.id);
         queues[mode].push(socket);
 
@@ -56,7 +61,7 @@ io.on('connection', (socket) => {
                 role: 'guest', roomId: roomId, mode: mode, botsCount: totalBots, opponent: player1.playerData
             });
         } else {
-            // مؤقت 8 ثوانٍ: إذا لم يدخل لاعب آخر، يبدأ اللعب فردياً مع البوتات
+            // مؤقت 8 ثوانٍ: إذا لم ينضم منافس آخر، يبدأ اللعب فردياً مع البوتات
             clearTimeout(matchmakingTimers[socket.id]);
             matchmakingTimers[socket.id] = setTimeout(() => {
                 const idx = queues[mode].findIndex(s => s.id === socket.id);
