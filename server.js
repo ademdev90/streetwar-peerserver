@@ -8,7 +8,6 @@ const io = new Server(server, {
     cors: { origin: "*" }
 });
 
-// مسار فحص للرد على UptimeRobot وإبقاء السيرفر مستيقظاً
 app.get('/ping', (req, res) => {
     res.status(200).send('Server is active');
 });
@@ -19,71 +18,67 @@ app.get('/', (req, res) => {
 
 const port = process.env.PORT || 9000;
 
-let queues = { br: [], dm: [], ctf: [] };
-let matchmakingTimers = {};
+// Structure to store rooms and timers
+let rooms = {};
+
+const LOBBY_WAIT_TIME = 180; // 3 Minutes in seconds
 
 io.on('connection', (socket) => {
-    console.log('لاعب متصل:', socket.id);
+    console.log('Player connected:', socket.id);
 
     socket.on('findMatch', (data) => {
         const mode = data.mode || 'br';
         socket.gameMode = mode;
         socket.playerData = data;
 
-        if (!queues[mode]) queues[mode] = [];
-        
-        // إزالة أي تسجيل سابق لنفس اللاعب
-        queues[mode] = queues[mode].filter(s => s.id !== socket.id);
-        queues[mode].push(socket);
+        // Find or create an available room for this mode
+        let roomId = Object.keys(rooms).find(id => rooms[id].mode === mode && !rooms[id].started && rooms[id].players.length < 10);
 
-        socket.emit('matchmakingStatus', '🔍 جاري البحث عن منافسين...');
+        if (!roomId) {
+            roomId = `room_${mode}_${Date.now()}`;
+            rooms[roomId] = {
+                id: roomId,
+                mode: mode,
+                players: [],
+                countdown: LOBBY_WAIT_TIME,
+                timer: null,
+                started: false
+            };
+        }
 
-        const maxPlayers = 10;
+        const room = rooms[roomId];
+        socket.join(roomId);
+        socket.currentRoomId = roomId;
 
-        // إذا توفر لاعبين حقيقيين أو أكثر
-        if (queues[mode].length >= 2) {
-            const player1 = queues[mode].shift();
-            const player2 = queues[mode].shift();
-
-            clearTimeout(matchmakingTimers[player1.id]);
-            clearTimeout(matchmakingTimers[player2.id]);
-
-            const roomId = `room_${mode}_${player1.id}_${player2.id}`;
-            player1.join(roomId);
-            player2.join(roomId);
-
-            const totalBots = maxPlayers - 2;
-
-            player1.emit('matchFound', {
-                role: 'host', roomId: roomId, mode: mode, botsCount: totalBots, opponent: player2.playerData
+        if (!room.players.some(p => p.id === socket.id)) {
+            room.players.push({
+                id: socket.id,
+                name: data.name || 'Player',
+                car: data.car || 0,
+                socket: socket
             });
-            player2.emit('matchFound', {
-                role: 'guest', roomId: roomId, mode: mode, botsCount: totalBots, opponent: player1.playerData
-            });
-        } else {
-            // مؤقت 8 ثوانٍ: إذا لم ينضم منافس آخر، يبدأ اللعب فردياً مع البوتات
-            clearTimeout(matchmakingTimers[socket.id]);
-            matchmakingTimers[socket.id] = setTimeout(() => {
-                const idx = queues[mode].findIndex(s => s.id === socket.id);
-                if (idx !== -1) {
-                    const p1 = queues[mode].splice(idx, 1)[0];
-                    const roomId = `room_${mode}_solo_${p1.id}`;
-                    p1.join(roomId);
+        }
 
-                    p1.emit('matchFound', {
-                        role: 'host', roomId: roomId, mode: mode, botsCount: maxPlayers - 1, opponent: null
-                    });
+        // Notify lobby players about current status
+        broadcastLobbyState(roomId);
+
+        // Start countdown timer if first player joins
+        if (!room.timer) {
+            room.timer = setInterval(() => {
+                room.countdown--;
+
+                if (room.countdown <= 0 || room.players.length >= 10) {
+                    clearInterval(room.timer);
+                    startGame(roomId);
+                } else {
+                    broadcastLobbyState(roomId);
                 }
-            }, 8000);
+            }, 1000);
         }
     });
 
     socket.on('cancelMatchmaking', () => {
-        clearTimeout(matchmakingTimers[socket.id]);
-        if (socket.gameMode && queues[socket.gameMode]) {
-            queues[socket.gameMode] = queues[socket.gameMode].filter(s => s.id !== socket.id);
-        }
-        socket.emit('matchmakingStatus', 'تم إلغاء البحث.');
+        leaveRoom(socket);
     });
 
     socket.on('sendPacket', (data) => {
@@ -91,13 +86,66 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        clearTimeout(matchmakingTimers[socket.id]);
-        if (socket.gameMode && queues[socket.gameMode]) {
-            queues[socket.gameMode] = queues[socket.gameMode].filter(s => s.id !== socket.id);
-        }
-        console.log('غادر اللاعب:', socket.id);
+        leaveRoom(socket);
+        console.log('Player disconnected:', socket.id);
     });
 });
+
+function broadcastLobbyState(roomId) {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    const playersList = room.players.map(p => ({ id: p.id, name: p.name }));
+    io.to(roomId).emit('lobbyUpdate', {
+        roomId: roomId,
+        playersCount: room.players.length,
+        maxPlayers: 10,
+        players: playersList,
+        countdown: room.countdown,
+        message: `Waiting for players... Starting in ${room.countdown}s`
+    });
+}
+
+function startGame(roomId) {
+    const room = rooms[roomId];
+    if (!room || room.started) return;
+
+    room.started = true;
+    const maxPlayers = 10;
+    const realPlayersCount = room.players.length;
+    const botsCount = Math.max(0, maxPlayers - realPlayersCount);
+
+    const hostPlayer = room.players[0];
+
+    room.players.forEach((p, index) => {
+        p.socket.emit('matchFound', {
+            role: index === 0 ? 'host' : 'guest',
+            roomId: roomId,
+            mode: room.mode,
+            botsCount: botsCount,
+            totalPlayers: realPlayersCount
+        });
+    });
+
+    console.log(`Game started in room ${roomId} with ${realPlayersCount} players and ${botsCount} bots.`);
+}
+
+function leaveRoom(socket) {
+    const roomId = socket.currentRoomId;
+    if (!roomId || !rooms[roomId]) return;
+
+    const room = rooms[roomId];
+    room.players = room.players.filter(p => p.id !== socket.id);
+    socket.leave(roomId);
+    socket.currentRoomId = null;
+
+    if (room.players.length === 0) {
+        clearInterval(room.timer);
+        delete rooms[roomId];
+    } else if (!room.started) {
+        broadcastLobbyState(roomId);
+    }
+}
 
 server.listen(port, () => {
     console.log(`Server running on port ${port}`);
