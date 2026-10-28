@@ -18,7 +18,7 @@ app.get('/', (req, res) => {
 
 const port = process.env.PORT || 9000;
 let rooms = {};
-const LOBBY_WAIT_TIME = 30; // 3 minutes
+const LOBBY_WAIT_TIME = 30; // 30 ثانية انتظار لبدء الجيم
 
 io.on('connection', (socket) => {
     socket.on('findMatch', (data) => {
@@ -99,17 +99,15 @@ function startGame(roomId) {
     if (!room || room.started) return;
 
     room.started = true;
-    const maxPlayers = 10;
-    const realPlayersCount = room.players.length;
-    const botsCount = Math.max(0, maxPlayers - realPlayersCount);
+    const realPlayersData = room.players.map(p => ({ id: p.id, name: p.name, car: p.car }));
 
     room.players.forEach((p, index) => {
         p.socket.emit('matchFound', {
             role: index === 0 ? 'host' : 'guest',
             roomId: roomId,
             mode: room.mode,
-            botsCount: botsCount,
-            totalPlayers: realPlayersCount
+            players: realPlayersData,
+            totalPlayers: realPlayersData.length
         });
     });
 }
