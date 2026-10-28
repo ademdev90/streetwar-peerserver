@@ -18,10 +18,8 @@ app.get('/', (req, res) => {
 
 const port = process.env.PORT || 9000;
 
-// Structure to store rooms and timers
 let rooms = {};
-
-const LOBBY_WAIT_TIME = 180; // 3 Minutes in seconds
+const LOBBY_WAIT_TIME = 180; // 3 minutes in seconds
 
 io.on('connection', (socket) => {
     console.log('Player connected:', socket.id);
@@ -31,7 +29,6 @@ io.on('connection', (socket) => {
         socket.gameMode = mode;
         socket.playerData = data;
 
-        // Find or create an available room for this mode
         let roomId = Object.keys(rooms).find(id => rooms[id].mode === mode && !rooms[id].started && rooms[id].players.length < 10);
 
         if (!roomId) {
@@ -59,10 +56,8 @@ io.on('connection', (socket) => {
             });
         }
 
-        // Notify lobby players about current status
         broadcastLobbyState(roomId);
 
-        // Start countdown timer if first player joins
         if (!room.timer) {
             room.timer = setInterval(() => {
                 room.countdown--;
@@ -114,8 +109,6 @@ function startGame(roomId) {
     const maxPlayers = 10;
     const realPlayersCount = room.players.length;
     const botsCount = Math.max(0, maxPlayers - realPlayersCount);
-
-    const hostPlayer = room.players[0];
 
     room.players.forEach((p, index) => {
         p.socket.emit('matchFound', {
