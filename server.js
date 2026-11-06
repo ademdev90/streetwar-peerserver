@@ -5,7 +5,7 @@ const { Server } = require('socket.io');
 const app = express();
 const server = http.createServer(app);
 
-// تعطيل خوارزمية Nagle لإرسال حزم اللعب فوراً بدون تأخير في طابور TCP
+// تعطيل خوارزمية Nagle (TCP_NODELAY) لإرسال الحزم فوراً بدون تأخير تجميع البيانات
 server.on('connection', (tcpSocket) => {
     tcpSocket.setNoDelay(true);
 });
@@ -13,13 +13,14 @@ server.on('connection', (tcpSocket) => {
 const io = new Server(server, {
     cors: { origin: "*" },
     transports: ['websocket', 'polling'],
-    perMessageDeflate: false,
+    perMessageDeflate: false, // إيقاف ضغط الحزم الصغيرة لتقليل الـ Latency واستهلاك المعالج
     httpCompression: false,
     pingInterval: 5000,
     pingTimeout: 10000
 });
 
 app.get('/ping', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
     res.status(200).send('Server is active');
 });
 
@@ -44,7 +45,7 @@ io.on('connection', (socket) => {
         if (typeof callback === 'function') {
             callback(sentAt);
         } else {
-            socket.emit('pongCheck', sentAt);
+            socket.volatile.emit('pongCheck', sentAt);
         }
     });
 
@@ -189,7 +190,7 @@ function startGame(roomId) {
 
     initServerWorld(room, realPlayersData, botsCount);
 
-    // إرسال العوائق الثابتة مرة واحدة فقط عند بداية المباراة لتخفيف حجم الحزم
+    // إرسال العوائق الثابتة مرة واحدة فقط في الحزمة الابتدائية
     const initialSnapshot = buildRoomSnapshot(room, true);
 
     room.players.forEach((p) => {
@@ -212,8 +213,9 @@ function startGame(roomId) {
 
     room.netInterval = setInterval(() => {
         if (!rooms[roomId] || room.finished) return;
+        // استخدام volatile لمنع تكدس الحزم القديمة وتقليل البينغ
         io.to(roomId).volatile.emit('serverState', buildRoomSnapshot(room, false));
-    }, 45);
+    }, 40);
 }
 
 function initServerWorld(room, realPlayers, botsCount) {
@@ -534,6 +536,9 @@ function updateServerCar(room, car) {
         return;
     }
 
+    if (car.shootCD > 0) car.shootCD--;
+    if (car.abilCD > 0) car.abilCD--;
+
     if (!car.isAI) {
         const control = room.inputs.get(car.uid) || {};
         driveServerCar(car, control);
@@ -555,8 +560,6 @@ function updateServerCar(room, car) {
         if (car.speed < -maxSlowSpeed * 0.5) car.speed = -maxSlowSpeed * 0.5;
     }
 
-    if (car.shootCD > 0) car.shootCD--;
-    if (car.abilCD > 0) car.abilCD--;
     if (car.abilActive > 0) {
         car.abilActive--;
         if (car.carType === 2) {
@@ -700,8 +703,8 @@ function createServerBullet(st, car, angOffset, isHeart = false) {
     st.bullets.push({
         x: car.x + Math.cos(shootAngle) * 25,
         y: car.y + Math.sin(shootAngle) * 25,
-        vx: Math.cos(shootAngle) * (isHeart ? 10 : 16),
-        vy: Math.sin(shootAngle) * (isHeart ? 10 : 16),
+        vx: Math.round(Math.cos(shootAngle) * (isHeart ? 10 : 16) * 100) / 100,
+        vy: Math.round(Math.sin(shootAngle) * (isHeart ? 10 : 16) * 100) / 100,
         ownerUid: car.uid,
         dmg: dmg,
         isHeart: isHeart
@@ -795,7 +798,7 @@ function finishServerMatch(room) {
     if (room.simInterval) clearInterval(room.simInterval);
     if (room.netInterval) clearInterval(room.netInterval);
 
-    const finalSnap = buildRoomSnapshot(room, true);
+    const finalSnap = buildRoomSnapshot(room, false);
     io.to(room.id).emit('matchEnded', { state: finalSnap });
 
     room.players.forEach(p => {
@@ -819,11 +822,15 @@ function buildRoomSnapshot(room, includeStatic = false) {
         dmTimer: st.dmTimer,
         redScore: st.redScore,
         blueScore: st.blueScore,
-        ctfFlags: st.mode === 'CTF' ? {
+        ctfFlags: {
             red: { x: Math.round(st.ctfFlags.red.x), y: Math.round(st.ctfFlags.red.y), baseX: st.ctfFlags.red.baseX, baseY: st.ctfFlags.red.baseY, hasCarrier: !!st.ctfFlags.red.carrierUid },
             blue: { x: Math.round(st.ctfFlags.blue.x), y: Math.round(st.ctfFlags.blue.y), baseX: st.ctfFlags.blue.baseX, baseY: st.ctfFlags.blue.baseY, hasCarrier: !!st.ctfFlags.blue.carrierUid }
-        } : null,
-        zone: { x: st.zone.x, y: st.zone.y, radius: Math.round(st.zone.radius * 10) / 10 },
+        },
+        zone: {
+            x: st.zone.x,
+            y: st.zone.y,
+            radius: Math.round(st.zone.radius * 10) / 10
+        },
         cars: st.cars.map(c => ({
             uid: c.uid, id: c.id, x: Math.round(c.x * 10) / 10, y: Math.round(c.y * 10) / 10,
             angle: Math.round(c.angle * 1000) / 1000, speed: Math.round(c.speed * 100) / 100,
@@ -836,13 +843,15 @@ function buildRoomSnapshot(room, includeStatic = false) {
             flagsScored: c.flagsScored || 0, rank: c.rank
         })),
         drops: st.drops,
-        mines: st.mines.map(m => ({ x: m.x, y: m.y, timer: m.timer })),
-        lavas: st.lavas.map(l => ({ x: l.x, y: l.y, timer: l.timer })),
-        bullets: st.bullets.map(b => ({ x: Math.round(b.x), y: Math.round(b.y), vx: Math.round(b.vx * 10) / 10, vy: Math.round(b.vy * 10) / 10, isHeart: !!b.isHeart }))
+        mines: st.mines.map(m => ({ x: Math.round(m.x), y: Math.round(m.y), timer: m.timer })),
+        lavas: st.lavas.map(l => ({ x: Math.round(l.x), y: Math.round(l.y), timer: l.timer })),
+        bullets: st.bullets.map(b => ({ x: Math.round(b.x), y: Math.round(b.y), vx: b.vx, vy: b.vy, isHeart: !!b.isHeart }))
     };
+
     if (includeStatic) {
         snap.obstacles = st.obstacles;
     }
+
     return snap;
 }
 
