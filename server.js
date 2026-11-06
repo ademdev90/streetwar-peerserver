@@ -43,6 +43,11 @@ io.on('connection', (socket) => {
                 timer: null,
                 started: false
             };
+
+socket.on('pingCheck', (sentAt, callback) => {
+        if (typeof callback === 'function') callback();
+        socket.emit('pongCheck', sentAt);
+    });
         }
 
         const room = rooms[roomId];
@@ -162,10 +167,3 @@ function leaveRoom(socket) {
 server.listen(port, () => {
     console.log(`Server running on port ${port}`);
 });
-
-
-
-socket.on('pingCheck', (sentAt, callback) => {
-        if (typeof callback === 'function') callback();
-        socket.emit('pongCheck', sentAt);
-    });
