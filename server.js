@@ -27,7 +27,6 @@ let rooms = {};
 let roomSequence = 1;
 
 io.on('connection', (socket) => {
-    // قياس البينغ المباشر لكل لاعب بشكل مستقل وعادل
     socket.on('pingCheck', (sentAt, callback) => {
         if (typeof callback === 'function') callback(sentAt);
         socket.emit('pongCheck', sentAt);
@@ -39,14 +38,13 @@ io.on('connection', (socket) => {
         const mode = (data.mode || 'br').toLowerCase();
         const playerName = (data.name || 'Player').toString().substring(0, 14);
         const playerCar = Number.isInteger(data.car) ? data.car : 0;
+        const playerHasPass = !!data.hasPass;
 
-        // البحث عن غرفة متاحة في نفس الطور لم تبدأ بعد وبها أقل من 10 لاعبين
         let targetRoomId = Object.keys(rooms).find(id => {
             const r = rooms[id];
             return r && r.mode === mode && !r.started && !r.isPrivate && r.players.length < 10;
         });
 
-        // إذا كانت كل الغرف الحالية قيد اللعب أو ممتلئة، أنشئ غرفة جديدة فوراً
         if (!targetRoomId) {
             targetRoomId = `room_${mode}_${roomSequence++}_${Date.now()}`;
             rooms[targetRoomId] = createNewRoomObject(targetRoomId, mode, false);
@@ -60,12 +58,12 @@ io.on('connection', (socket) => {
             id: socket.id,
             name: playerName,
             car: playerCar,
+            hasPass: playerHasPass,
             socket: socket
         });
 
         broadcastLobbyState(targetRoomId);
 
-        // إذا اكتمل 10 لاعبين، ابدأ فوراً
         if (room.players.length >= 10) {
             if (room.lobbyTimer) {
                 clearInterval(room.lobbyTimer);
@@ -75,7 +73,6 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // تشغيل عداد اللوبي للغرفة الحالية
         if (!room.lobbyTimer) {
             room.lobbyTimer = setInterval(() => {
                 if (!rooms[targetRoomId] || rooms[targetRoomId].started) {
@@ -94,7 +91,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // استلام أزرار التحكم مباشرة من اللاعب إلى السيرفر المركزي
     socket.on('playerInput', (data) => {
         const roomId = socket.currentRoomId;
         if (!roomId || !rooms[roomId] || !rooms[roomId].started) return;
@@ -104,7 +100,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // دعم الرسائل الإضافية والغرف الخاصة
     socket.on('sendPacket', (data) => {
         if (!data || !data.roomId) return;
         const room = rooms[data.roomId];
@@ -148,7 +143,7 @@ function createNewRoomObject(id, mode, isPrivate = false) {
 function broadcastLobbyState(roomId) {
     const room = rooms[roomId];
     if (!room || room.started) return;
-    const playersList = room.players.map(p => ({ id: p.id, name: p.name, car: p.car }));
+    const playersList = room.players.map(p => ({ id: p.id, name: p.name, car: p.car, hasPass: !!p.hasPass }));
     io.to(roomId).emit('lobbyUpdate', {
         roomId: roomId,
         playersCount: room.players.length,
@@ -171,16 +166,15 @@ function startGame(roomId) {
     const realPlayersData = room.players.map(p => ({
         id: p.id,
         name: p.name,
-        car: p.car
+        car: p.car,
+        hasPass: !!p.hasPass
     }));
     const botsCount = Math.max(0, 10 - realPlayersData.length);
 
-    // تهيئة عالم المباراة بالكامل على السيرفر المركزي
     initServerWorld(room, realPlayersData, botsCount);
 
     const initialSnapshot = buildRoomSnapshot(room);
 
-    // إشعار جميع اللاعبين بنفس اللحظة وبنفس الصلاحية (بدون Host/Guest)
     room.players.forEach((p) => {
         p.socket.emit('matchFound', {
             role: 'player',
@@ -194,13 +188,11 @@ function startGame(roomId) {
         });
     });
 
-    // حلقة الفيزياء المركزية على السيرفر (60 مرة في الثانية)
     room.simInterval = setInterval(() => {
         if (!rooms[roomId] || room.finished) return;
         simulateRoomStep(room);
     }, 1000 / 60);
 
-    // بث حالة اللعبة الموحدة لجميع اللاعبين (25 مرة في الثانية لتقليل استهلاك الإنترنت وتثبيت البينغ)
     room.netInterval = setInterval(() => {
         if (!rooms[roomId] || room.finished) return;
         io.to(roomId).emit('serverState', buildRoomSnapshot(room));
@@ -230,7 +222,7 @@ function initServerWorld(room, realPlayers, botsCount) {
             ? MAP_SIZE / 2 - 200 + Math.random() * 400
             : 300 + Math.random() * (MAP_SIZE - 600);
 
-        cars.push(createServerCar(pData.id, pData.name, sX, sY, false, pData.car, team));
+        cars.push(createServerCar(pData.id, pData.name, sX, sY, false, pData.car, team, !!pData.hasPass));
     });
 
     for (let i = 0; i < botsCount; i++) {
@@ -245,7 +237,7 @@ function initServerWorld(room, realPlayers, botsCount) {
             ? MAP_SIZE / 2 - 200 + Math.random() * 400
             : 300 + Math.random() * (MAP_SIZE - 600);
         const bName = BOT_NAMES[i] || `Bot_${i + 1}`;
-        cars.push(createServerCar(`bot_${i}`, bName, bX, bY, true, bType, team));
+        cars.push(createServerCar(`bot_${i}`, bName, bX, bY, true, bType, team, false));
     }
 
     room.state = {
@@ -269,7 +261,7 @@ function initServerWorld(room, realPlayers, botsCount) {
     };
 }
 
-function createServerCar(uid, name, x, y, isAI, carType, team) {
+function createServerCar(uid, name, x, y, isAI, carType, team, hasPass = false) {
     return {
         uid: uid,
         id: name,
@@ -283,6 +275,7 @@ function createServerCar(uid, name, x, y, isAI, carType, team) {
         maxHp: 100,
         isAI: isAI,
         carType: carType || 0,
+        hasPass: !!hasPass,
         w: 38,
         h: 65,
         alive: true,
@@ -291,6 +284,7 @@ function createServerCar(uid, name, x, y, isAI, carType, team) {
         abilActive: 0,
         shield: 0,
         stunTimer: 0,
+        slowTimer: 0,
         respawnTimer: 0,
         kills: 0,
         dmgDealt: 0,
@@ -341,7 +335,6 @@ function simulateRoomStep(room) {
         });
     }
 
-    // تحديث الألغام (Blackhole Mines)
     for (let i = st.mines.length - 1; i >= 0; i--) {
         const m = st.mines[i];
         m.timer--;
@@ -365,7 +358,7 @@ function simulateRoomStep(room) {
         }
     }
 
-    // تحديث الحمم (Lava Pools)
+    // تحديث الحمم في السيرفر: تفعيل slowTimer بالتساوي على جميع الأعداء (لاعبين وبوتات)
     for (let i = st.lavas.length - 1; i >= 0; i--) {
         const l = st.lavas[i];
         l.timer--;
@@ -373,14 +366,14 @@ function simulateRoomStep(room) {
         st.cars.forEach(c => {
             if (c.alive && !c.isReviving && c.uid !== l.ownerUid && Math.hypot(c.x - l.x, c.y - l.y) < 120) {
                 if (st.mode === 'CTF' && ownerCar && c.team === ownerCar.team) return;
-                c.speed *= 0.6;
+                c.slowTimer = 12;
+                c.speed *= 0.42;
                 damageServerCar(room, c, 0.5, ownerCar);
             }
         });
         if (l.timer <= 0) st.lavas.splice(i, 1);
     }
 
-    // منطق الأعلام CTF
     if (st.mode === 'CTF') {
         st.cars.forEach(c => {
             if (!c.alive || c.isReviving) return;
@@ -431,10 +424,8 @@ function simulateRoomStep(room) {
         }
     }
 
-    // تحديث جميع السيارات (اللاعبين + البوتات)
     st.cars.forEach(c => updateServerCar(room, c));
 
-    // تحديث الطلقات
     for (let i = st.bullets.length - 1; i >= 0; i--) {
         const b = st.bullets[i];
         const ownerCar = st.cars.find(c => c.uid === b.ownerUid);
@@ -476,7 +467,6 @@ function simulateRoomStep(room) {
         }
     }
 
-    // فحص شروط انتهاء المباراة
     if (st.mode === 'DM' || st.mode === 'CTF') {
         if (st.dmTimer <= 0) {
             finishServerMatch(room);
@@ -508,6 +498,7 @@ function updateServerCar(room, car) {
                 }
                 car.abilActive = 0;
                 car.stunTimer = 0;
+                car.slowTimer = 0;
             }
         }
         return;
@@ -539,6 +530,14 @@ function updateServerCar(room, car) {
         }
     } else {
         updateServerBotAI(st, car);
+    }
+
+    // تطبيق التباطؤ بعد حساب سرعة البوت أو اللاعب لضمان المساواة الكاملة
+    if (car.slowTimer > 0) {
+        car.slowTimer--;
+        const maxSlowSpeed = car.maxSpeed * 0.42;
+        if (car.speed > maxSlowSpeed) car.speed = maxSlowSpeed;
+        if (car.speed < -maxSlowSpeed * 0.5) car.speed = -maxSlowSpeed * 0.5;
     }
 
     if (car.shootCD > 0) car.shootCD--;
@@ -769,6 +768,7 @@ function damageServerCar(room, car, amt, attacker) {
 
         io.to(room.id).emit('killEvent', {
             killer: attacker ? attacker.id : 'The Storm',
+            killerHasPass: !!(attacker && attacker.hasPass),
             victim: car.id
         });
     }
@@ -783,7 +783,6 @@ function finishServerMatch(room) {
     const finalSnap = buildRoomSnapshot(room);
     io.to(room.id).emit('matchEnded', { state: finalSnap });
 
-    // فصل جميع اللاعبين عن الغرفة المنتهية وحذفها فوراً لكي لا تعلق أي غرف قديمة
     room.players.forEach(p => {
         if (p.socket) {
             p.socket.leave(room.id);
@@ -815,7 +814,8 @@ function buildRoomSnapshot(room) {
             angle: Math.round(c.angle * 1000) / 1000, speed: Math.round(c.speed * 100) / 100,
             hp: Math.round(c.hp * 10) / 10, maxHp: c.maxHp, alive: c.alive,
             isAI: c.isAI, carType: c.carType, team: c.team, hasFlag: c.hasFlag,
-            isReviving: c.isReviving, respawnTimer: c.respawnTimer, stunTimer: c.stunTimer,
+            hasPass: !!c.hasPass, isReviving: c.isReviving, respawnTimer: c.respawnTimer,
+            stunTimer: c.stunTimer, slowTimer: c.slowTimer || 0,
             shield: Math.round(c.shield), abilActive: c.abilActive, abilCD: c.abilCD,
             shootCD: c.shootCD, kills: c.kills, dmgDealt: Math.round(c.dmgDealt || 0),
             flagsScored: c.flagsScored || 0, rank: c.rank
@@ -848,7 +848,6 @@ function leaveRoom(socket) {
     } else if (!room.started) {
         broadcastLobbyState(roomId);
     } else if (room.state) {
-        // إذا غادر لاعب أثناء الجيم، يتحول مكانه إلى بوت ذكاء اصطناعي لكي تستمر المباراة بسلاسة
         const leavingCar = room.state.cars.find(c => c.uid === socket.id);
         if (leavingCar) leavingCar.isAI = true;
     }
