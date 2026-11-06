@@ -4,8 +4,17 @@ const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
+
+// تعطيل خوارزمية Nagle لإرسال حزم اللعب فوراً بدون تأخير في طابور TCP
+server.on('connection', (tcpSocket) => {
+    tcpSocket.setNoDelay(true);
+});
+
 const io = new Server(server, {
     cors: { origin: "*" },
+    transports: ['websocket', 'polling'],
+    perMessageDeflate: false,
+    httpCompression: false,
     pingInterval: 5000,
     pingTimeout: 10000
 });
@@ -27,9 +36,16 @@ let rooms = {};
 let roomSequence = 1;
 
 io.on('connection', (socket) => {
+    if (socket.conn && socket.conn.transport && socket.conn.transport.socket) {
+        try { socket.conn.transport.socket.setNoDelay(true); } catch (e) {}
+    }
+
     socket.on('pingCheck', (sentAt, callback) => {
-        if (typeof callback === 'function') callback(sentAt);
-        socket.emit('pongCheck', sentAt);
+        if (typeof callback === 'function') {
+            callback(sentAt);
+        } else {
+            socket.emit('pongCheck', sentAt);
+        }
     });
 
     socket.on('findMatch', (data = {}) => {
@@ -173,7 +189,8 @@ function startGame(roomId) {
 
     initServerWorld(room, realPlayersData, botsCount);
 
-    const initialSnapshot = buildRoomSnapshot(room);
+    // إرسال العوائق الثابتة مرة واحدة فقط عند بداية المباراة لتخفيف حجم الحزم
+    const initialSnapshot = buildRoomSnapshot(room, true);
 
     room.players.forEach((p) => {
         p.socket.emit('matchFound', {
@@ -195,8 +212,8 @@ function startGame(roomId) {
 
     room.netInterval = setInterval(() => {
         if (!rooms[roomId] || room.finished) return;
-        io.to(roomId).emit('serverState', buildRoomSnapshot(room));
-    }, 40);
+        io.to(roomId).volatile.emit('serverState', buildRoomSnapshot(room, false));
+    }, 45);
 }
 
 function initServerWorld(room, realPlayers, botsCount) {
@@ -206,9 +223,9 @@ function initServerWorld(room, realPlayers, botsCount) {
     const obstacles = [];
     for (let i = 0; i < 40; i++) {
         obstacles.push({
-            x: 100 + Math.random() * (MAP_SIZE - 200),
-            y: 100 + Math.random() * (MAP_SIZE - 200),
-            r: 30 + Math.random() * 50
+            x: Math.round(100 + Math.random() * (MAP_SIZE - 200)),
+            y: Math.round(100 + Math.random() * (MAP_SIZE - 200)),
+            r: Math.round(30 + Math.random() * 50)
         });
     }
 
@@ -328,8 +345,8 @@ function simulateRoomStep(room) {
 
     if (st.timer % 600 === 0 && st.drops.length < 5) {
         st.drops.push({
-            x: st.zone.x + (Math.random() - 0.5) * st.zone.radius * 1.5,
-            y: st.zone.y + (Math.random() - 0.5) * st.zone.radius * 1.5,
+            x: Math.round(st.zone.x + (Math.random() - 0.5) * st.zone.radius * 1.5),
+            y: Math.round(st.zone.y + (Math.random() - 0.5) * st.zone.radius * 1.5),
             r: 20,
             type: Math.random() > 0.5 ? 'hp' : 'shield'
         });
@@ -358,7 +375,6 @@ function simulateRoomStep(room) {
         }
     }
 
-    // تحديث الحمم في السيرفر: تفعيل slowTimer بالتساوي على جميع الأعداء (لاعبين وبوتات)
     for (let i = st.lavas.length - 1; i >= 0; i--) {
         const l = st.lavas[i];
         l.timer--;
@@ -532,7 +548,6 @@ function updateServerCar(room, car) {
         updateServerBotAI(st, car);
     }
 
-    // تطبيق التباطؤ بعد حساب سرعة البوت أو اللاعب لضمان المساواة الكاملة
     if (car.slowTimer > 0) {
         car.slowTimer--;
         const maxSlowSpeed = car.maxSpeed * 0.42;
@@ -710,7 +725,7 @@ function serverCarAbility(st, car) {
     else if (car.carType === 5) { car.abilCD = 600; car.abilActive = 180; }
     else if (car.carType === 6) {
         car.abilCD = 600;
-        st.mines.push({ x: car.x, y: car.y, timer: 300, ownerUid: car.uid });
+        st.mines.push({ x: Math.round(car.x), y: Math.round(car.y), timer: 300, ownerUid: car.uid });
     }
     else if (car.carType === 7) {
         car.abilCD = 900;
@@ -723,7 +738,7 @@ function serverCarAbility(st, car) {
     }
     else if (car.carType === 9) {
         car.abilCD = 900;
-        st.lavas.push({ x: car.x, y: car.y, timer: 300, ownerUid: car.uid });
+        st.lavas.push({ x: Math.round(car.x), y: Math.round(car.y), timer: 300, ownerUid: car.uid });
     }
 }
 
@@ -780,7 +795,7 @@ function finishServerMatch(room) {
     if (room.simInterval) clearInterval(room.simInterval);
     if (room.netInterval) clearInterval(room.netInterval);
 
-    const finalSnap = buildRoomSnapshot(room);
+    const finalSnap = buildRoomSnapshot(room, true);
     io.to(room.id).emit('matchEnded', { state: finalSnap });
 
     room.players.forEach(p => {
@@ -794,21 +809,21 @@ function finishServerMatch(room) {
     delete rooms[room.id];
 }
 
-function buildRoomSnapshot(room) {
+function buildRoomSnapshot(room, includeStatic = false) {
     const st = room.state;
     if (!st) return null;
-    return {
+    const snap = {
         map: st.map,
         mode: st.mode,
         timer: st.timer,
         dmTimer: st.dmTimer,
         redScore: st.redScore,
         blueScore: st.blueScore,
-        ctfFlags: {
-            red: { x: st.ctfFlags.red.x, y: st.ctfFlags.red.y, baseX: st.ctfFlags.red.baseX, baseY: st.ctfFlags.red.baseY, hasCarrier: !!st.ctfFlags.red.carrierUid },
-            blue: { x: st.ctfFlags.blue.x, y: st.ctfFlags.blue.y, baseX: st.ctfFlags.blue.baseX, baseY: st.ctfFlags.blue.baseY, hasCarrier: !!st.ctfFlags.blue.carrierUid }
-        },
-        zone: st.zone,
+        ctfFlags: st.mode === 'CTF' ? {
+            red: { x: Math.round(st.ctfFlags.red.x), y: Math.round(st.ctfFlags.red.y), baseX: st.ctfFlags.red.baseX, baseY: st.ctfFlags.red.baseY, hasCarrier: !!st.ctfFlags.red.carrierUid },
+            blue: { x: Math.round(st.ctfFlags.blue.x), y: Math.round(st.ctfFlags.blue.y), baseX: st.ctfFlags.blue.baseX, baseY: st.ctfFlags.blue.baseY, hasCarrier: !!st.ctfFlags.blue.carrierUid }
+        } : null,
+        zone: { x: st.zone.x, y: st.zone.y, radius: Math.round(st.zone.radius * 10) / 10 },
         cars: st.cars.map(c => ({
             uid: c.uid, id: c.id, x: Math.round(c.x * 10) / 10, y: Math.round(c.y * 10) / 10,
             angle: Math.round(c.angle * 1000) / 1000, speed: Math.round(c.speed * 100) / 100,
@@ -820,12 +835,15 @@ function buildRoomSnapshot(room) {
             shootCD: c.shootCD, kills: c.kills, dmgDealt: Math.round(c.dmgDealt || 0),
             flagsScored: c.flagsScored || 0, rank: c.rank
         })),
-        obstacles: st.obstacles,
         drops: st.drops,
         mines: st.mines.map(m => ({ x: m.x, y: m.y, timer: m.timer })),
         lavas: st.lavas.map(l => ({ x: l.x, y: l.y, timer: l.timer })),
-        bullets: st.bullets.map(b => ({ x: Math.round(b.x), y: Math.round(b.y), vx: b.vx, vy: b.vy, isHeart: !!b.isHeart }))
+        bullets: st.bullets.map(b => ({ x: Math.round(b.x), y: Math.round(b.y), vx: Math.round(b.vx * 10) / 10, vy: Math.round(b.vy * 10) / 10, isHeart: !!b.isHeart }))
     };
+    if (includeStatic) {
+        snap.obstacles = st.obstacles;
+    }
+    return snap;
 }
 
 function leaveRoom(socket) {
