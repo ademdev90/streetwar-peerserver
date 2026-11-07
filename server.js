@@ -245,7 +245,7 @@ function initServerWorld(room, realPlayers, botsCount) {
     });
 
     for (let i = 0; i < botsCount; i++) {
-        const bType = Math.random() > 0.3 ? Math.floor(Math.random() * 5) : Math.floor(Math.random() * 5) + 5;
+        const bType = Math.floor(Math.random() * 13);
         const redCount = cars.filter(c => c.team === 'red').length;
         const blueCount = cars.filter(c => c.team === 'blue').length;
         const team = mode === 'CTF' ? (redCount <= blueCount ? 'red' : 'blue') : null;
@@ -256,7 +256,8 @@ function initServerWorld(room, realPlayers, botsCount) {
             ? MAP_SIZE / 2 - 200 + Math.random() * 400
             : 300 + Math.random() * (MAP_SIZE - 600);
         const bName = BOT_NAMES[i] || `Bot_${i + 1}`;
-        cars.push(createServerCar(`bot_${i}`, bName, bX, bY, true, bType, 1, team, false));
+        const botSec = Math.floor(Math.random() * 6) + 1;
+        cars.push(createServerCar(`bot_${i}`, bName, bX, bY, true, bType, botSec, team, false));
     }
 
     room.state = {
@@ -276,6 +277,7 @@ function initServerWorld(room, realPlayers, botsCount) {
         drops: [],
         mines: [],
         lavas: [],
+        fogs: [],
         turrets: [],
         walls: [],
         bullets: []
@@ -299,6 +301,7 @@ function createServerCar(uid, name, x, y, isAI, carType, secType, team, hasPass 
         secType: secType || 1,
         secCD: 0,
         radarTimer: 0,
+        visionTimer: 0,
         dualSkillReady: false,
         bonusCarType: 0,
         cdBoostReady: false,
@@ -312,6 +315,11 @@ function createServerCar(uid, name, x, y, isAI, carType, secType, team, hasPass 
         shield: 0,
         stunTimer: 0,
         slowTimer: 0,
+        silenceTimer: 0,
+        blindTimer: 0,
+        mindControlTimer: 0,
+        controlledTargetUid: null,
+        controlledByUid: null,
         respawnTimer: 0,
         kills: 0,
         dmgDealt: 0,
@@ -321,6 +329,26 @@ function createServerCar(uid, name, x, y, isAI, carType, secType, team, hasPass 
         hasFlag: null,
         rank: 1
     };
+}
+
+function clearServerMindControlLinks(st, car) {
+    if (!st || !car) return;
+    if (car.controlledTargetUid) {
+        const t = st.cars.find(c => c.uid === car.controlledTargetUid);
+        if (t && t.controlledByUid === car.uid) {
+            t.controlledByUid = null;
+        }
+    }
+    if (car.controlledByUid) {
+        const ctrlCar = st.cars.find(c => c.uid === car.controlledByUid);
+        if (ctrlCar && ctrlCar.controlledTargetUid === car.uid) {
+            ctrlCar.controlledTargetUid = null;
+            ctrlCar.mindControlTimer = 0;
+        }
+    }
+    car.controlledTargetUid = null;
+    car.controlledByUid = null;
+    car.mindControlTimer = 0;
 }
 
 function carHasTrait(car, typeId) {
@@ -404,6 +432,20 @@ function simulateRoomStep(room) {
         if (l.timer <= 0) st.lavas.splice(i, 1);
     }
 
+    // تحديث مناطق الضباب المشوش للرؤية (Car 11: Mirage Hazmat)
+    for (let i = st.fogs.length - 1; i >= 0; i--) {
+        const fg = st.fogs[i];
+        fg.timer--;
+        const ownerCar = st.cars.find(c => c.uid === fg.ownerUid);
+        st.cars.forEach(c => {
+            if (c.alive && !c.isReviving && c.uid !== fg.ownerUid && Math.hypot(c.x - fg.x, c.y - fg.y) < 145) {
+                if (st.mode === 'CTF' && ownerCar && c.team === ownerCar.team) return;
+                c.blindTimer = 300; // 5 ثوانٍ من تغبيش الرؤية والخريطة
+            }
+        });
+        if (fg.timer <= 0) st.fogs.splice(i, 1);
+    }
+
     // تحديث روبوتات السنايبر في السيرفر
     for (let i = st.turrets.length - 1; i >= 0; i--) {
         let t = st.turrets[i];
@@ -426,10 +468,14 @@ function simulateRoomStep(room) {
                     y: t.y + Math.sin(t.angle) * 20,
                     vx: Math.cos(t.angle) * 22,
                     vy: Math.sin(t.angle) * 22,
+                    angle: t.angle,
                     ownerUid: t.ownerUid,
-                    dmg: 55, // ضربتان تقتلان أي سيارة
+                    sourceUid: t.ownerUid,
+                    dmg: 55,
                     isHeart: false,
-                    isSniper: true
+                    isSniper: true,
+                    isEmpArc: false,
+                    isHackArrow: false
                 });
                 t.shootCD = 85;
             }
@@ -527,6 +573,7 @@ function simulateRoomStep(room) {
                 const ang = Math.atan2(closest.y - b.y, closest.x - b.x);
                 b.vx = Math.cos(ang) * 10;
                 b.vy = Math.sin(ang) * 10;
+                b.angle = ang;
             }
         }
 
@@ -546,7 +593,9 @@ function simulateRoomStep(room) {
                     if (distanceToSegment(b.x, b.y, x1, y1, x2, y2) < 16) {
                         b.vx = -b.vx;
                         b.vy = -b.vy;
+                        b.angle = Math.atan2(b.vy, b.vx);
                         b.ownerUid = w.ownerUid;
+                        b.sourceUid = w.ownerUid;
                         b.x += b.vx * 1.2;
                         b.y += b.vy * 1.2;
                         break;
@@ -557,14 +606,36 @@ function simulateRoomStep(room) {
 
         let hit = st.obstacles.some(o => Math.hypot(b.x - o.x, b.y - o.y) < o.r);
         if (!hit) {
+            const hitRadius = b.isEmpArc ? 38 : (b.isHackArrow ? 32 : 28);
+            const ignoreUid = b.sourceUid || b.ownerUid;
             const target = st.cars.find(c =>
-                c.alive && !c.isReviving && c.uid !== b.ownerUid &&
-                Math.hypot(c.x - b.x, c.y - b.y) < 28 &&
+                c.alive && !c.isReviving &&
+                c.uid !== ignoreUid && c.uid !== b.ownerUid &&
+                Math.hypot(c.x - b.x, c.y - b.y) < hitRadius &&
                 (st.mode !== 'CTF' || !ownerCar || c.team !== ownerCar.team)
             );
             if (target) {
-                if (b.isHeart) target.stunTimer = 180;
-                else damageServerCar(room, target, b.dmg, ownerCar);
+                if (b.isHeart) {
+                    target.stunTimer = 180;
+                } else if (b.isEmpArc) {
+                    // قوس سيارة الشرطة (Car 10): يمنع قدرات العدو الرئيسية والثانوية لمدة 5 ثوانٍ (300 إطار)
+                    target.silenceTimer = 300;
+                    target.abilActive = 0;
+                    damageServerCar(room, target, b.dmg || 15, ownerCar);
+                } else if (b.isHackArrow) {
+                    // سهم سيارة الهاكر (Car 12): التحكم بالعدو وقدراته لمدة 10 ثوانٍ (600 إطار)
+                    if (ownerCar && ownerCar.alive && !ownerCar.isReviving) {
+                        clearServerMindControlLinks(st, ownerCar);
+                        clearServerMindControlLinks(st, target);
+                        ownerCar.mindControlTimer = 600;
+                        ownerCar.controlledTargetUid = target.uid;
+                        target.controlledByUid = ownerCar.uid;
+                        target.mindControlTimer = 600;
+                    }
+                    damageServerCar(room, target, b.dmg || 10, ownerCar);
+                } else {
+                    damageServerCar(room, target, b.dmg, ownerCar);
+                }
                 hit = true;
             }
         }
@@ -606,6 +677,9 @@ function updateServerCar(room, car) {
                 car.bonusCarType = 0;
                 car.stunTimer = 0;
                 car.slowTimer = 0;
+                car.silenceTimer = 0;
+                car.blindTimer = 0;
+                clearServerMindControlLinks(st, car);
             }
         }
         return;
@@ -620,6 +694,29 @@ function updateServerCar(room, car) {
         return;
     }
 
+    if (car.silenceTimer > 0) car.silenceTimer--;
+    if (car.blindTimer > 0) car.blindTimer--;
+    if (car.visionTimer > 0) car.visionTimer--;
+    if (car.mindControlTimer > 0) {
+        car.mindControlTimer--;
+        if (car.mindControlTimer <= 0) {
+            clearServerMindControlLinks(st, car);
+        }
+    }
+
+    if (car.controlledTargetUid) {
+        const t = st.cars.find(c => c.uid === car.controlledTargetUid);
+        if (!t || !t.alive || t.isReviving) {
+            clearServerMindControlLinks(st, car);
+        }
+    }
+    if (car.controlledByUid) {
+        const ctrlCar = st.cars.find(c => c.uid === car.controlledByUid);
+        if (!ctrlCar || !ctrlCar.alive || ctrlCar.isReviving || ctrlCar.mindControlTimer <= 0) {
+            car.controlledByUid = null;
+        }
+    }
+
     if (car.stunTimer > 0) {
         car.stunTimer--;
         return;
@@ -630,7 +727,37 @@ function updateServerCar(room, car) {
     if (car.secCD > 0) car.secCD--;
     if (car.radarTimer > 0) car.radarTimer--;
 
-    if (!car.isAI) {
+    const activeController = car.controlledByUid
+        ? st.cars.find(c => c.uid === car.controlledByUid && c.alive && !c.isReviving)
+        : null;
+
+    if (activeController) {
+        let ctrl = {};
+        if (!activeController.isAI) {
+            ctrl = room.inputs.get(activeController.uid) || {};
+        } else {
+            ctrl = {
+                up: true,
+                left: Math.sin(st.timer * 0.08) > 0.3,
+                right: Math.cos(st.timer * 0.08) > 0.3,
+                shoot: (st.timer % 20 === 0),
+                ability: true
+            };
+        }
+        driveServerCar(car, ctrl);
+        if (ctrl.shoot && car.shootCD <= 0) {
+            serverCarShoot(st, car, activeController.uid);
+            car.shootCD = 12;
+        }
+        if (ctrl.ability && car.abilCD <= 0 && car.silenceTimer <= 0) {
+            serverCarAbility(st, car);
+        }
+        if (ctrl.secAbility && car.secCD <= 0 && car.silenceTimer <= 0) {
+            serverCarSecondaryAbility(st, car);
+        }
+    } else if (car.controlledTargetUid && car.mindControlTimer > 0) {
+        car.speed *= 0.84;
+    } else if (!car.isAI) {
         const control = room.inputs.get(car.uid) || {};
         driveServerCar(car, control);
         if (control.secType) car.secType = control.secType;
@@ -639,10 +766,10 @@ function updateServerCar(room, car) {
             serverCarShoot(st, car);
             car.shootCD = 12;
         }
-        if (control.ability && car.abilCD <= 0) {
+        if (control.ability && car.abilCD <= 0 && car.silenceTimer <= 0) {
             serverCarAbility(st, car);
         }
-        if (control.secAbility && car.secCD <= 0) {
+        if (control.secAbility && car.secCD <= 0 && car.silenceTimer <= 0) {
             serverCarSecondaryAbility(st, car);
         }
     } else {
@@ -752,7 +879,7 @@ function updateServerBotAI(st, car) {
             serverCarShoot(st, car);
             car.shootCD = 25;
         }
-        if (car.abilCD <= 0) {
+        if (car.abilCD <= 0 && car.silenceTimer <= 0) {
             if ((car.carType === 1 && car.hp < 60) ||
                 (car.carType === 2 && minDist < 150) ||
                 (car.carType === 3 && minDist < 350) ||
@@ -761,7 +888,10 @@ function updateServerBotAI(st, car) {
                 (car.carType === 6 && minDist < 200) ||
                 (car.carType === 7 && minDist < 600) ||
                 (car.carType === 8 && car.hp < 30) ||
-                (car.carType === 9 && minDist < 250)) {
+                (car.carType === 9 && minDist < 250) ||
+                (car.carType === 10 && minDist < 420) ||
+                (car.carType === 11 && minDist < 260) ||
+                (car.carType === 12 && minDist < 420 && (diffCheck < 0.25 || diffCheck > Math.PI * 2 - 0.25))) {
                 serverCarAbility(st, car);
             }
         }
@@ -781,11 +911,12 @@ function updateServerBotAI(st, car) {
     }
 }
 
-function createServerBullet(st, car, angOffset, isHeart = false) {
+function createServerBullet(st, car, angOffset, isHeart = false, customDmg = null, isSniper = false, isEmpArc = false, isHackArrow = false, customOwnerUid = null) {
     let shootAngle = car.angle + angOffset;
-    const dmg = isHeart ? 0 : 18;
+    const dmg = isHeart ? 0 : (customDmg !== null ? customDmg : 18);
 
-    if (carHasTrait(car, 4) && car.abilActive > 0 && !isHeart) {
+    // سهم الاختراق وقوس الشرطة ينطلقان للأمام مباشرة بدون Auto-Aim
+    if (carHasTrait(car, 4) && car.abilActive > 0 && !isHeart && !isHackArrow && !isEmpArc) {
         let closest = null, minDist = Infinity;
         st.cars.forEach(c => {
             if (c.uid !== car.uid && c.alive && !c.isReviving) {
@@ -799,23 +930,28 @@ function createServerBullet(st, car, angOffset, isHeart = false) {
         }
     }
 
+    const speed = isHeart ? 10 : (isSniper ? 22 : (isHackArrow ? 18 : (isEmpArc ? 15 : 16)));
     st.bullets.push({
-        x: car.x + Math.cos(shootAngle) * 25,
-        y: car.y + Math.sin(shootAngle) * 25,
-        vx: Math.round(Math.cos(shootAngle) * (isHeart ? 10 : 16) * 100) / 100,
-        vy: Math.round(Math.sin(shootAngle) * (isHeart ? 10 : 16) * 100) / 100,
-        ownerUid: car.uid,
+        x: car.x + Math.cos(shootAngle) * 28,
+        y: car.y + Math.sin(shootAngle) * 28,
+        vx: Math.round(Math.cos(shootAngle) * speed * 100) / 100,
+        vy: Math.round(Math.sin(shootAngle) * speed * 100) / 100,
+        angle: Math.round(shootAngle * 1000) / 1000,
+        ownerUid: customOwnerUid || car.uid,
+        sourceUid: car.uid,
         dmg: dmg,
         isHeart: isHeart,
-        isSniper: false
+        isSniper: isSniper,
+        isEmpArc: isEmpArc,
+        isHackArrow: isHackArrow
     });
 }
 
-function serverCarShoot(st, car) {
-    createServerBullet(st, car, 0, false);
+function serverCarShoot(st, car, customOwnerUid = null) {
+    createServerBullet(st, car, 0, false, null, false, false, false, customOwnerUid);
     if (carHasTrait(car, 3) && car.abilActive > 0) {
-        createServerBullet(st, car, 0.2, false);
-        createServerBullet(st, car, -0.2, false);
+        createServerBullet(st, car, 0.2, false, null, false, false, false, customOwnerUid);
+        createServerBullet(st, car, -0.2, false, null, false, false, false, customOwnerUid);
     }
 }
 
@@ -842,9 +978,25 @@ function executeServerSkillEffect(st, car, skillType) {
         car.abilCD = Math.max(car.abilCD, 900);
         st.lavas.push({ x: Math.round(car.x), y: Math.round(car.y), timer: 300, ownerUid: car.uid });
     }
+    else if (skillType === 10) {
+        // سيارة الشرطة (Car 10): قوس EMP يمنع القدرات 5 ثوانٍ، التهدئة 10 ثوانٍ (600 إطار)
+        car.abilCD = Math.max(car.abilCD, 600);
+        createServerBullet(st, car, 0, false, 15, false, true, false);
+    }
+    else if (skillType === 11) {
+        // سيارة الضباب والتشويش (Car 11): منطقة ضباب لمدة 5 ثوانٍ، التهدئة 10 ثوانٍ (600 إطار)
+        car.abilCD = Math.max(car.abilCD, 600);
+        st.fogs.push({ x: Math.round(car.x), y: Math.round(car.y), timer: 300, ownerUid: car.uid });
+    }
+    else if (skillType === 12) {
+        // سيارة المتحكم/الهاكر (Car 12): سهم اختراق يتحكم بالعدو 10 ثوانٍ، التهدئة 15 ثانية (900 إطار)
+        car.abilCD = Math.max(car.abilCD, 900);
+        createServerBullet(st, car, 0, false, 10, false, false, true);
+    }
 }
 
 function serverCarAbility(st, car) {
+    if (car.silenceTimer > 0) return;
     if (car.carType === 0 && !car.dualSkillReady) return;
     car.bonusCarType = 0;
     if (car.carType > 0) {
@@ -853,7 +1005,7 @@ function serverCarAbility(st, car) {
 
     if (car.dualSkillReady) {
         car.dualSkillReady = false;
-        const pool = [1, 2, 3, 4, 5, 6, 7, 8, 9].filter(t => t !== car.carType);
+        const pool = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].filter(t => t !== car.carType);
         const randomSkill = pool[Math.floor(Math.random() * pool.length)];
         car.bonusCarType = randomSkill;
         executeServerSkillEffect(st, car, randomSkill);
@@ -866,8 +1018,10 @@ function serverCarAbility(st, car) {
 }
 
 function serverCarSecondaryAbility(st, car) {
+    if (car.silenceTimer > 0) return;
     const sType = car.secType || 1;
-    car.secCD = 420;
+    // القدرة السادسة (Wide Vision) تهدئتها 8 ثوانٍ (480 إطار)، والبقية 7 ثوانٍ (420 إطار)
+    car.secCD = (sType === 6) ? 480 : 420;
 
     if (sType === 1) {
         car.radarTimer = 600;
@@ -900,6 +1054,9 @@ function serverCarSecondaryAbility(st, car) {
         } else {
             car.cdBoostReady = true;
         }
+    } else if (sType === 6) {
+        // القدرة الثانوية 6: توسيع الرؤية لمدة 6 ثوانٍ (360 إطار)
+        car.visionTimer = 360;
     }
 }
 
@@ -933,6 +1090,7 @@ function damageServerCar(room, car, amt, attacker) {
         }
         car.alive = false;
         car.hasFlag = null;
+        clearServerMindControlLinks(st, car);
         if (st.mode === 'DM' || st.mode === 'CTF') {
             car.respawnTimer = 180;
         } else {
@@ -995,10 +1153,14 @@ function buildRoomSnapshot(room, includeStatic = false) {
             angle: Math.round(c.angle * 1000) / 1000, speed: Math.round(c.speed * 100) / 100,
             hp: Math.round(c.hp * 10) / 10, maxHp: c.maxHp, alive: c.alive,
             isAI: c.isAI, carType: c.carType, secType: c.secType || 1, secCD: c.secCD || 0,
-            radarTimer: c.radarTimer || 0, dualSkillReady: !!c.dualSkillReady,
+            radarTimer: c.radarTimer || 0, visionTimer: c.visionTimer || 0, dualSkillReady: !!c.dualSkillReady,
             bonusCarType: c.bonusCarType || 0, cdBoostReady: !!c.cdBoostReady, team: c.team, hasFlag: c.hasFlag,
             hasPass: !!c.hasPass, isReviving: c.isReviving, respawnTimer: c.respawnTimer,
             stunTimer: c.stunTimer, slowTimer: c.slowTimer || 0,
+            silenceTimer: c.silenceTimer || 0, blindTimer: c.blindTimer || 0,
+            mindControlTimer: c.mindControlTimer || 0,
+            controlledTargetUid: c.controlledTargetUid || null,
+            controlledByUid: c.controlledByUid || null,
             shield: Math.round(c.shield), abilActive: c.abilActive, abilCD: c.abilCD,
             shootCD: c.shootCD, kills: c.kills, dmgDealt: Math.round(c.dmgDealt || 0),
             flagsScored: c.flagsScored || 0, rank: c.rank
@@ -1006,9 +1168,15 @@ function buildRoomSnapshot(room, includeStatic = false) {
         drops: st.drops,
         mines: st.mines.map(m => ({ x: Math.round(m.x), y: Math.round(m.y), timer: m.timer })),
         lavas: st.lavas.map(l => ({ x: Math.round(l.x), y: Math.round(l.y), timer: l.timer })),
+        fogs: st.fogs.map(f => ({ x: Math.round(f.x), y: Math.round(f.y), timer: f.timer })),
         turrets: st.turrets.map(t => ({ x: Math.round(t.x), y: Math.round(t.y), angle: t.angle, timer: t.timer })),
         walls: st.walls.map(w => ({ x: Math.round(w.x), y: Math.round(w.y), angle: w.angle, length: w.length || 115, timer: w.timer })),
-        bullets: st.bullets.map(b => ({ x: Math.round(b.x), y: Math.round(b.y), vx: b.vx, vy: b.vy, isHeart: !!b.isHeart, isSniper: !!b.isSniper }))
+        bullets: st.bullets.map(b => ({
+            x: Math.round(b.x), y: Math.round(b.y),
+            vx: b.vx, vy: b.vy, angle: b.angle || 0,
+            isHeart: !!b.isHeart, isSniper: !!b.isSniper,
+            isEmpArc: !!b.isEmpArc, isHackArrow: !!b.isHackArrow
+        }))
     };
 
     if (includeStatic) {
@@ -1039,7 +1207,10 @@ function leaveRoom(socket) {
         broadcastLobbyState(roomId);
     } else if (room.state) {
         const leavingCar = room.state.cars.find(c => c.uid === socket.id);
-        if (leavingCar) leavingCar.isAI = true;
+        if (leavingCar) {
+            clearServerMindControlLinks(room.state, leavingCar);
+            leavingCar.isAI = true;
+        }
     }
 }
 
