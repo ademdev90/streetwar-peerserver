@@ -35,6 +35,23 @@ const BOT_NAMES = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot', 'Gol
 let rooms = {};
 let roomSequence = 1;
 
+// تحديد الحد الأقصى للاعبين حسب الطور (6 لاعبين أي 3 ضد 3 في طور سرقة العلم CTF، و10 في البقية)
+function getMaxPlayersForMode(mode) {
+    return (mode || 'br').toLowerCase() === 'ctf' ? 6 : 10;
+}
+
+function generatePrivateCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = '';
+    do {
+        code = '';
+        for (let i = 0; i < 6; i++) {
+            code += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+    } while (Object.values(rooms).some(r => r && r.code === code));
+    return code;
+}
+
 io.on('connection', (socket) => {
     if (socket.conn && socket.conn.transport && socket.conn.transport.socket) {
         try { socket.conn.transport.socket.setNoDelay(true); } catch (e) {}
@@ -48,10 +65,12 @@ io.on('connection', (socket) => {
         }
     });
 
+    // البحث العشوائي السريع (Quick Matchmaking)
     socket.on('findMatch', (data = {}) => {
         leaveRoom(socket);
 
         const mode = (data.mode || 'br').toLowerCase();
+        const maxPlayers = getMaxPlayersForMode(mode);
         const playerName = (data.name || 'Player').toString().substring(0, 14);
         const playerCar = Number.isInteger(data.car) ? data.car : 0;
         const playerSecAbil = Number.isInteger(data.secAbil) ? data.secAbil : 1;
@@ -59,7 +78,7 @@ io.on('connection', (socket) => {
 
         let targetRoomId = Object.keys(rooms).find(id => {
             const r = rooms[id];
-            return r && r.mode === mode && !r.started && !r.isPrivate && r.players.length < 10;
+            return r && r.mode === mode && !r.started && !r.isPrivate && r.players.length < maxPlayers;
         });
 
         if (!targetRoomId) {
@@ -82,7 +101,7 @@ io.on('connection', (socket) => {
 
         broadcastLobbyState(targetRoomId);
 
-        if (room.players.length >= 10) {
+        if (room.players.length >= maxPlayers) {
             if (room.lobbyTimer) {
                 clearInterval(room.lobbyTimer);
                 room.lobbyTimer = null;
@@ -98,7 +117,7 @@ io.on('connection', (socket) => {
                     return;
                 }
                 room.countdown--;
-                if (room.countdown <= 0 || room.players.length >= 10) {
+                if (room.countdown <= 0 || room.players.length >= getMaxPlayersForMode(room.mode)) {
                     clearInterval(room.lobbyTimer);
                     room.lobbyTimer = null;
                     startGame(targetRoomId);
@@ -107,6 +126,119 @@ io.on('connection', (socket) => {
                 }
             }, 1000);
         }
+    });
+
+    // إنشاء روم خاص (Custom Private Room)
+    socket.on('createPrivateRoom', (data = {}) => {
+        leaveRoom(socket);
+
+        const mode = (data.mode || 'br').toLowerCase();
+        const allowBots = data.allowBots !== false;
+        const playerName = (data.name || 'Player').toString().substring(0, 14);
+        const playerCar = Number.isInteger(data.car) ? data.car : 0;
+        const playerSecAbil = Number.isInteger(data.secAbil) ? data.secAbil : 1;
+        const playerHasPass = !!data.hasPass;
+
+        const code = generatePrivateCode();
+        const roomId = `priv_${code}_${Date.now()}`;
+        const room = createNewRoomObject(roomId, mode, true);
+        room.code = code;
+        room.hostId = socket.id;
+        room.allowBots = allowBots;
+        rooms[roomId] = room;
+
+        socket.join(roomId);
+        socket.currentRoomId = roomId;
+
+        room.players.push({
+            id: socket.id,
+            name: playerName,
+            car: playerCar,
+            secAbil: playerSecAbil,
+            hasPass: playerHasPass,
+            socket: socket
+        });
+
+        socket.emit('privateRoomCreated', buildPrivateRoomPayload(room));
+    });
+
+    // الانضمام إلى روم خاص عبر الكود أو الرابط
+    socket.on('joinPrivateRoom', (data = {}) => {
+        const cleanCode = (data.code || '').toString().trim().toUpperCase();
+        if (!cleanCode) {
+            socket.emit('privateRoomError', { message: 'Invalid Room Code!' });
+            return;
+        }
+
+        const targetRoomId = Object.keys(rooms).find(id => {
+            const r = rooms[id];
+            return r && r.isPrivate && r.code === cleanCode;
+        });
+
+        if (!targetRoomId || !rooms[targetRoomId]) {
+            socket.emit('privateRoomError', { message: 'Room not found or expired!' });
+            return;
+        }
+
+        const room = rooms[targetRoomId];
+        if (room.started) {
+            socket.emit('privateRoomError', { message: 'Match already started in this room!' });
+            return;
+        }
+
+        const maxPlayers = getMaxPlayersForMode(room.mode);
+        if (room.players.length >= maxPlayers) {
+            socket.emit('privateRoomError', { message: `Room is full (${maxPlayers}/${maxPlayers})!` });
+            return;
+        }
+
+        leaveRoom(socket);
+
+        const playerName = (data.name || 'Player').toString().substring(0, 14);
+        const playerCar = Number.isInteger(data.car) ? data.car : 0;
+        const playerSecAbil = Number.isInteger(data.secAbil) ? data.secAbil : 1;
+        const playerHasPass = !!data.hasPass;
+
+        socket.join(targetRoomId);
+        socket.currentRoomId = targetRoomId;
+
+        room.players.push({
+            id: socket.id,
+            name: playerName,
+            car: playerCar,
+            secAbil: playerSecAbil,
+            hasPass: playerHasPass,
+            socket: socket
+        });
+
+        broadcastPrivateRoomState(targetRoomId);
+    });
+
+    // تحديث إعدادات الروم الخاص (تغيير المود أو تفعيل/منع البوتات) من قِبل صاحب الروم
+    socket.on('updatePrivateRoom', (data = {}) => {
+        const roomId = socket.currentRoomId;
+        const room = roomId ? rooms[roomId] : null;
+        if (!room || !room.isPrivate || room.started || room.hostId !== socket.id) return;
+
+        if (data.mode) {
+            const nextMode = data.mode.toString().toLowerCase();
+            if (['br', 'dm', 'ctf'].includes(nextMode)) {
+                room.mode = nextMode;
+            }
+        }
+        if (typeof data.allowBots === 'boolean') {
+            room.allowBots = data.allowBots;
+        }
+
+        broadcastPrivateRoomState(roomId);
+    });
+
+    // بدء مباراة الروم الخاص من قِبل صاحب الروم
+    socket.on('startPrivateRoom', () => {
+        const roomId = socket.currentRoomId;
+        const room = roomId ? rooms[roomId] : null;
+        if (!room || !room.isPrivate || room.started || room.hostId !== socket.id) return;
+        startGame(roomId);
     });
 
     socket.on('playerInput', (data) => {
@@ -144,8 +276,11 @@ io.on('connection', (socket) => {
 function createNewRoomObject(id, mode, isPrivate = false) {
     return {
         id: id,
+        code: null,
+        hostId: null,
         mode: mode,
         isPrivate: isPrivate,
+        allowBots: true,
         players: [],
         inputs: new Map(),
         countdown: LOBBY_WAIT_TIME,
@@ -158,14 +293,41 @@ function createNewRoomObject(id, mode, isPrivate = false) {
     };
 }
 
+function buildPrivateRoomPayload(room) {
+    const maxPlayers = getMaxPlayersForMode(room.mode);
+    return {
+        roomId: room.id,
+        code: room.code,
+        hostId: room.hostId,
+        mode: room.mode,
+        allowBots: room.allowBots !== false,
+        playersCount: room.players.length,
+        maxPlayers: maxPlayers,
+        players: room.players.map(p => ({
+            id: p.id,
+            name: p.name,
+            car: p.car,
+            secAbil: p.secAbil,
+            hasPass: !!p.hasPass
+        }))
+    };
+}
+
+function broadcastPrivateRoomState(roomId) {
+    const room = rooms[roomId];
+    if (!room || !room.isPrivate || room.started) return;
+    io.to(roomId).emit('privateRoomUpdate', buildPrivateRoomPayload(room));
+}
+
 function broadcastLobbyState(roomId) {
     const room = rooms[roomId];
     if (!room || room.started) return;
+    const maxPlayers = getMaxPlayersForMode(room.mode);
     const playersList = room.players.map(p => ({ id: p.id, name: p.name, car: p.car, secAbil: p.secAbil, hasPass: !!p.hasPass }));
     io.to(roomId).emit('lobbyUpdate', {
         roomId: roomId,
         playersCount: room.players.length,
-        maxPlayers: 10,
+        maxPlayers: maxPlayers,
         players: playersList,
         countdown: room.countdown
     });
@@ -181,6 +343,7 @@ function startGame(roomId) {
         room.lobbyTimer = null;
     }
 
+    const maxPlayers = getMaxPlayersForMode(room.mode);
     const realPlayersData = room.players.map(p => ({
         id: p.id,
         name: p.name,
@@ -188,7 +351,11 @@ function startGame(roomId) {
         secAbil: p.secAbil || 1,
         hasPass: !!p.hasPass
     }));
-    const botsCount = Math.max(0, 10 - realPlayersData.length);
+
+    // إذا كان الروم خاصاً وتم إيقاف البوتات من قِبل صاحب الروم، يكون عدد البوتات 0
+    const botsCount = (room.isPrivate && !room.allowBots)
+        ? 0
+        : Math.max(0, maxPlayers - realPlayersData.length);
 
     initServerWorld(room, realPlayersData, botsCount);
 
@@ -198,6 +365,7 @@ function startGame(roomId) {
         p.socket.emit('matchFound', {
             role: 'player',
             serverAuthoritative: true,
+            isPrivate: !!room.isPrivate,
             roomId: roomId,
             mode: room.mode,
             players: realPlayersData,
@@ -263,6 +431,7 @@ function initServerWorld(room, realPlayers, botsCount) {
     room.state = {
         map: mapIndex,
         mode: mode,
+        initialCarsCount: cars.length,
         timer: 0,
         dmTimer: 180 * 60,
         redScore: 0,
@@ -440,7 +609,7 @@ function simulateRoomStep(room) {
         st.cars.forEach(c => {
             if (c.alive && !c.isReviving && c.uid !== fg.ownerUid && Math.hypot(c.x - fg.x, c.y - fg.y) < 145) {
                 if (st.mode === 'CTF' && ownerCar && c.team === ownerCar.team) return;
-                c.blindTimer = 300; // 5 ثوانٍ من تغبيش الرؤية والخريطة
+                c.blindTimer = 300;
             }
         });
         if (fg.timer <= 0) st.fogs.splice(i, 1);
@@ -580,7 +749,6 @@ function simulateRoomStep(room) {
         b.x += b.vx;
         b.y += b.vy;
 
-        // اصطدام الطلقة بالجدار العاكس في السيرفر (القدرة الثانوية 4)
         for (const w of st.walls) {
             if (b.ownerUid !== w.ownerUid) {
                 const wallOwner = st.cars.find(c => c.uid === w.ownerUid);
@@ -618,12 +786,10 @@ function simulateRoomStep(room) {
                 if (b.isHeart) {
                     target.stunTimer = 180;
                 } else if (b.isEmpArc) {
-                    // قوس سيارة الشرطة (Car 10): يمنع قدرات العدو الرئيسية والثانوية لمدة 5 ثوانٍ (300 إطار)
                     target.silenceTimer = 300;
                     target.abilActive = 0;
                     damageServerCar(room, target, b.dmg || 15, ownerCar);
                 } else if (b.isHackArrow) {
-                    // سهم سيارة الهاكر (Car 12): التحكم بالعدو وقدراته لمدة 10 ثوانٍ (600 إطار)
                     if (ownerCar && ownerCar.alive && !ownerCar.isReviving) {
                         clearServerMindControlLinks(st, ownerCar);
                         clearServerMindControlLinks(st, target);
@@ -651,7 +817,9 @@ function simulateRoomStep(room) {
     } else {
         const aliveCars = st.cars.filter(c => c.alive);
         const aliveHumans = st.cars.filter(c => !c.isAI && c.alive);
-        if (aliveCars.length <= 1 || aliveHumans.length === 0) {
+        // إذا بدأ صاحب الروم الخاص وحده مع إيقاف البوتات، لا تنتهي المباراة فوراً إلا عند موته
+        const minAliveToEnd = (st.initialCarsCount && st.initialCarsCount <= 1) ? 0 : 1;
+        if (aliveCars.length <= minAliveToEnd || aliveHumans.length === 0) {
             finishServerMatch(room);
         }
     }
@@ -915,7 +1083,6 @@ function createServerBullet(st, car, angOffset, isHeart = false, customDmg = nul
     let shootAngle = car.angle + angOffset;
     const dmg = isHeart ? 0 : (customDmg !== null ? customDmg : 18);
 
-    // سهم الاختراق وقوس الشرطة ينطلقان للأمام مباشرة بدون Auto-Aim
     if (carHasTrait(car, 4) && car.abilActive > 0 && !isHeart && !isHackArrow && !isEmpArc) {
         let closest = null, minDist = Infinity;
         st.cars.forEach(c => {
@@ -979,17 +1146,14 @@ function executeServerSkillEffect(st, car, skillType) {
         st.lavas.push({ x: Math.round(car.x), y: Math.round(car.y), timer: 300, ownerUid: car.uid });
     }
     else if (skillType === 10) {
-        // سيارة الشرطة (Car 10): قوس EMP يمنع القدرات 5 ثوانٍ، التهدئة 10 ثوانٍ (600 إطار)
         car.abilCD = Math.max(car.abilCD, 600);
         createServerBullet(st, car, 0, false, 15, false, true, false);
     }
     else if (skillType === 11) {
-        // سيارة الضباب والتشويش (Car 11): منطقة ضباب لمدة 5 ثوانٍ، التهدئة 10 ثوانٍ (600 إطار)
         car.abilCD = Math.max(car.abilCD, 600);
         st.fogs.push({ x: Math.round(car.x), y: Math.round(car.y), timer: 300, ownerUid: car.uid });
     }
     else if (skillType === 12) {
-        // سيارة المتحكم/الهاكر (Car 12): سهم اختراق يتحكم بالعدو 10 ثوانٍ، التهدئة 15 ثانية (900 إطار)
         car.abilCD = Math.max(car.abilCD, 900);
         createServerBullet(st, car, 0, false, 10, false, false, true);
     }
@@ -1020,7 +1184,6 @@ function serverCarAbility(st, car) {
 function serverCarSecondaryAbility(st, car) {
     if (car.silenceTimer > 0) return;
     const sType = car.secType || 1;
-    // القدرة السادسة (Wide Vision) تهدئتها 8 ثوانٍ (480 إطار)، والبقية 7 ثوانٍ (420 إطار)
     car.secCD = (sType === 6) ? 480 : 420;
 
     if (sType === 1) {
@@ -1055,7 +1218,6 @@ function serverCarSecondaryAbility(st, car) {
             car.cdBoostReady = true;
         }
     } else if (sType === 6) {
-        // القدرة الثانوية 6: توسيع الرؤية لمدة 6 ثوانٍ (360 إطار)
         car.visionTimer = 360;
     }
 }
@@ -1204,7 +1366,14 @@ function leaveRoom(socket) {
         if (room.netInterval) clearInterval(room.netInterval);
         delete rooms[roomId];
     } else if (!room.started) {
-        broadcastLobbyState(roomId);
+        if (room.isPrivate) {
+            if (room.hostId === socket.id) {
+                room.hostId = room.players[0].id;
+            }
+            broadcastPrivateRoomState(roomId);
+        } else {
+            broadcastLobbyState(roomId);
+        }
     } else if (room.state) {
         const leavingCar = room.state.cars.find(c => c.uid === socket.id);
         if (leavingCar) {
