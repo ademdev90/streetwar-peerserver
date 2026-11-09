@@ -35,6 +35,7 @@ const BOT_NAMES = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot', 'Gol
 let rooms = {};
 let roomSequence = 1;
 
+// تحديد الحد الأقصى للاعبين حسب الطور (6 لاعبين أي 3 ضد 3 في طور سرقة العلم CTF، و10 في البقية)
 function getMaxPlayersForMode(mode) {
     return (mode || 'br').toLowerCase() === 'ctf' ? 6 : 10;
 }
@@ -64,6 +65,7 @@ io.on('connection', (socket) => {
         }
     });
 
+    // البحث العشوائي السريع (Quick Matchmaking)
     socket.on('findMatch', (data = {}) => {
         leaveRoom(socket);
 
@@ -126,6 +128,7 @@ io.on('connection', (socket) => {
         }
     });
 
+    // إنشاء روم خاص (Custom Private Room)
     socket.on('createPrivateRoom', (data = {}) => {
         leaveRoom(socket);
 
@@ -159,6 +162,7 @@ io.on('connection', (socket) => {
         socket.emit('privateRoomCreated', buildPrivateRoomPayload(room));
     });
 
+    // الانضمام إلى روم خاص عبر الكود أو الرابط
     socket.on('joinPrivateRoom', (data = {}) => {
         const cleanCode = (data.code || '').toString().trim().toUpperCase();
         if (!cleanCode) {
@@ -210,6 +214,7 @@ io.on('connection', (socket) => {
         broadcastPrivateRoomState(targetRoomId);
     });
 
+    // تحديث إعدادات الروم الخاص (تغيير المود أو تفعيل/منع البوتات) من قِبل صاحب الروم
     socket.on('updatePrivateRoom', (data = {}) => {
         const roomId = socket.currentRoomId;
         const room = roomId ? rooms[roomId] : null;
@@ -228,6 +233,7 @@ io.on('connection', (socket) => {
         broadcastPrivateRoomState(roomId);
     });
 
+    // بدء مباراة الروم الخاص من قِبل صاحب الروم
     socket.on('startPrivateRoom', () => {
         const roomId = socket.currentRoomId;
         const room = roomId ? rooms[roomId] : null;
@@ -346,6 +352,7 @@ function startGame(roomId) {
         hasPass: !!p.hasPass
     }));
 
+    // إذا كان الروم خاصاً وتم إيقاف البوتات من قِبل صاحب الروم، يكون عدد البوتات 0
     const botsCount = (room.isPrivate && !room.allowBots)
         ? 0
         : Math.max(0, maxPlayers - realPlayersData.length);
@@ -465,7 +472,7 @@ function createServerCar(uid, name, x, y, isAI, carType, secType, team, hasPass 
         radarTimer: 0,
         visionTimer: 0,
         dualSkillReady: false,
-        bonusCarType: 0,
+        bonusCarType: -1,
         cdBoostReady: false,
         hasPass: !!hasPass,
         w: 38,
@@ -517,7 +524,7 @@ function clearServerMindControlLinks(st, car) {
 }
 
 function carHasTrait(car, typeId) {
-    return car.carType === typeId || (car.abilActive > 0 && car.bonusCarType === typeId);
+    return car.carType === typeId || (car.abilActive > 0 && car.bonusCarType > 0 && car.bonusCarType === typeId);
 }
 
 function driveServerCar(car, control) {
@@ -597,6 +604,7 @@ function simulateRoomStep(room) {
         if (l.timer <= 0) st.lavas.splice(i, 1);
     }
 
+    // تحديث مناطق الضباب المشوش للرؤية (Car 11: Mirage Hazmat)
     for (let i = st.fogs.length - 1; i >= 0; i--) {
         const fg = st.fogs[i];
         fg.timer--;
@@ -610,6 +618,7 @@ function simulateRoomStep(room) {
         if (fg.timer <= 0) st.fogs.splice(i, 1);
     }
 
+    // تحديث روبوتات السنايبر في السيرفر
     for (let i = st.turrets.length - 1; i >= 0; i--) {
         let t = st.turrets[i];
         t.timer--;
@@ -648,6 +657,7 @@ function simulateRoomStep(room) {
         }
     }
 
+    // تحديث الجدران العاكسة المؤقتة في السيرفر
     for (let i = st.walls.length - 1; i >= 0; i--) {
         st.walls[i].timer--;
         if (st.walls[i].timer <= 0) st.walls.splice(i, 1);
@@ -810,6 +820,7 @@ function simulateRoomStep(room) {
     } else {
         const aliveCars = st.cars.filter(c => c.alive);
         const aliveHumans = st.cars.filter(c => !c.isAI && c.alive);
+        // إذا بدأ صاحب الروم الخاص وحده مع إيقاف البوتات، لا تنتهي المباراة فوراً إلا عند موته
         const minAliveToEnd = (st.initialCarsCount && st.initialCarsCount <= 1) ? 0 : 1;
         if (aliveCars.length <= minAliveToEnd || aliveHumans.length === 0) {
             finishServerMatch(room);
@@ -836,7 +847,7 @@ function updateServerCar(room, car) {
                     car.y = 300 + Math.random() * (MAP_SIZE - 600);
                 }
                 car.abilActive = 0;
-                car.bonusCarType = 0;
+                car.bonusCarType = -1;
                 car.stunTimer = 0;
                 car.slowTimer = 0;
                 car.silenceTimer = 0;
@@ -858,11 +869,8 @@ function updateServerCar(room, car) {
 
     if (car.reloadTimer > 0) {
         car.reloadTimer--;
-        if (car.reloadTimer <= 0) {
-            car.ammo = car.maxAmmo;
-        }
+        if (car.reloadTimer <= 0) car.ammo = car.maxAmmo;
     }
-
     if (car.silenceTimer > 0) car.silenceTimer--;
     if (car.blindTimer > 0) car.blindTimer--;
     if (car.visionTimer > 0) car.visionTimer--;
@@ -922,6 +930,7 @@ function updateServerCar(room, car) {
                 serverCarShoot(st, car, activeController.uid);
                 car.ammo--;
                 car.shootCD = 12;
+                if (car.ammo <= 0) car.reloadTimer = 90;
             } else {
                 car.reloadTimer = 90;
             }
@@ -942,12 +951,12 @@ function updateServerCar(room, car) {
         if (control.reload && car.reloadTimer <= 0 && car.ammo < car.maxAmmo) {
             car.reloadTimer = 90;
         }
-
         if (control.shoot && car.shootCD <= 0 && car.reloadTimer <= 0) {
             if (car.ammo > 0) {
                 serverCarShoot(st, car);
                 car.ammo--;
                 car.shootCD = 12;
+                if (car.ammo <= 0) car.reloadTimer = 90;
             } else {
                 car.reloadTimer = 90;
             }
@@ -980,7 +989,7 @@ function updateServerCar(room, car) {
             });
         }
         if (car.abilActive <= 0) {
-            car.bonusCarType = 0;
+            car.bonusCarType = -1;
         }
     }
 
@@ -1016,10 +1025,7 @@ function updateServerCar(room, car) {
 }
 
 function updateServerBotAI(st, car) {
-    if (car.ammo <= 0 && car.reloadTimer <= 0) {
-        car.reloadTimer = 90;
-    }
-
+    if (car.ammo <= 0 && car.reloadTimer <= 0) car.reloadTimer = 90;
     let closest = null, minDist = Infinity;
     st.cars.forEach(c => {
         if (c.uid !== car.uid && c.alive && !c.isReviving) {
@@ -1071,7 +1077,7 @@ function updateServerBotAI(st, car) {
             car.shootCD = 25;
         }
         if (car.abilCD <= 0 && car.silenceTimer <= 0) {
-            if ((car.carType === 0 && car.hp < 70) ||
+            if ((car.carType === 0 && car.hp < 75 && car.shield <= 0) ||
                 (car.carType === 1 && car.hp < 60) ||
                 (car.carType === 2 && minDist < 150) ||
                 (car.carType === 3 && minDist < 350) ||
@@ -1147,7 +1153,7 @@ function serverCarShoot(st, car, customOwnerUid = null) {
 }
 
 function executeServerSkillEffect(st, car, skillType) {
-    if (skillType === 0) { car.abilCD = Math.max(car.abilCD, 600); car.abilActive = Math.max(car.abilActive, 200); car.shield = Math.min(100, car.shield + 50); }
+    if (skillType === 0) { car.abilCD = Math.max(car.abilCD, 600); car.shield = Math.min(100, car.shield + 50); }
     else if (skillType === 1) { car.abilCD = Math.max(car.abilCD, 600); car.abilActive = Math.max(car.abilActive, 200); car.hp = Math.min(100, car.hp + 50); }
     else if (skillType === 2) { car.abilCD = Math.max(car.abilCD, 600); car.abilActive = Math.max(car.abilActive, 200); }
     else if (skillType === 3) { car.abilCD = Math.max(car.abilCD, 600); car.abilActive = Math.max(car.abilActive, 200); }
@@ -1186,7 +1192,7 @@ function executeServerSkillEffect(st, car, skillType) {
 
 function serverCarAbility(st, car) {
     if (car.silenceTimer > 0) return;
-    car.bonusCarType = 0;
+    car.bonusCarType = -1;
     executeServerSkillEffect(st, car, car.carType);
 
     if (car.dualSkillReady) {
@@ -1269,7 +1275,7 @@ function damageServerCar(room, car, amt, attacker) {
             car.respawnTimer = 180;
             car.hp = 0.1;
             car.abilActive = 0;
-            car.bonusCarType = 0;
+            car.bonusCarType = -1;
             return;
         }
         car.alive = false;
@@ -1338,16 +1344,16 @@ function buildRoomSnapshot(room, includeStatic = false) {
             hp: Math.round(c.hp * 10) / 10, maxHp: c.maxHp, alive: c.alive,
             isAI: c.isAI, carType: c.carType, secType: c.secType || 1, secCD: c.secCD || 0,
             radarTimer: c.radarTimer || 0, visionTimer: c.visionTimer || 0, dualSkillReady: !!c.dualSkillReady,
-            bonusCarType: c.bonusCarType || 0, cdBoostReady: !!c.cdBoostReady, team: c.team, hasFlag: c.hasFlag,
+            bonusCarType: typeof c.bonusCarType === 'number' ? c.bonusCarType : -1, cdBoostReady: !!c.cdBoostReady, team: c.team, hasFlag: c.hasFlag,
             hasPass: !!c.hasPass, isReviving: c.isReviving, respawnTimer: c.respawnTimer,
             stunTimer: c.stunTimer, slowTimer: c.slowTimer || 0,
             silenceTimer: c.silenceTimer || 0, blindTimer: c.blindTimer || 0,
             mindControlTimer: c.mindControlTimer || 0,
             controlledTargetUid: c.controlledTargetUid || null,
             controlledByUid: c.controlledByUid || null,
-            shield: Math.round(c.shield), ammo: c.ammo, maxAmmo: c.maxAmmo, reloadTimer: c.reloadTimer || 0,
-            abilActive: c.abilActive, abilCD: c.abilCD, shootCD: c.shootCD,
-            kills: c.kills, dmgDealt: Math.round(c.dmgDealt || 0), flagsScored: c.flagsScored || 0, rank: c.rank
+            shield: Math.round(c.shield), ammo: c.ammo, maxAmmo: c.maxAmmo, reloadTimer: c.reloadTimer || 0, abilActive: c.abilActive, abilCD: c.abilCD,
+            shootCD: c.shootCD, kills: c.kills, dmgDealt: Math.round(c.dmgDealt || 0),
+            flagsScored: c.flagsScored || 0, rank: c.rank
         })),
         drops: st.drops,
         mines: st.mines.map(m => ({ x: Math.round(m.x), y: Math.round(m.y), timer: m.timer })),
