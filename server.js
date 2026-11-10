@@ -36,11 +36,8 @@ let rooms = {};
 let roomSequence = 1;
 
 // تحديد الحد الأقصى للاعبين حسب الطور (6 لاعبين أي 3 ضد 3 في طور سرقة العلم CTF، و10 في البقية)
-function getMaxPlayersForMode(mode, squad = 'solo') {
-    const m = (mode || 'br').toLowerCase();
-    if (m === 'ctf') return 6; // 3v3
-    if (squad === 'trio') return 12; // 4 teams of 3
-    return 10;
+function getMaxPlayersForMode(mode) {
+    return (mode || 'br').toLowerCase() === 'ctf' ? 6 : 10;
 }
 
 function generatePrivateCode() {
@@ -485,7 +482,6 @@ function createServerCar(uid, name, x, y, isAI, carType, secType, team, hasPass 
         abilCD: 0,
         abilActive: 0,
         shield: 0,
-        shieldTimer: 0,
         ammo: 12,
         maxAmmo: 12,
         reloadTimer: 0,
@@ -875,11 +871,6 @@ function updateServerCar(room, car) {
         car.reloadTimer--;
         if (car.reloadTimer <= 0) car.ammo = car.maxAmmo;
     }
-    if (car.shieldTimer > 0) {
-        car.shieldTimer--;
-        if (car.shieldTimer <= 0) car.shield = 0;
-    }
-    if (car.shield <= 0) car.shield = 0;
     if (car.silenceTimer > 0) car.silenceTimer--;
     if (car.blindTimer > 0) car.blindTimer--;
     if (car.visionTimer > 0) car.visionTimer--;
@@ -1162,7 +1153,7 @@ function serverCarShoot(st, car, customOwnerUid = null) {
 }
 
 function executeServerSkillEffect(st, car, skillType) {
-    if (skillType === 0) { car.abilCD = Math.max(car.abilCD, 900); car.shield = 100; car.shieldTimer = 600; }
+    if (skillType === 0) { car.abilCD = Math.max(car.abilCD, 600); car.shield = Math.min(100, car.shield + 50); }
     else if (skillType === 1) { car.abilCD = Math.max(car.abilCD, 600); car.abilActive = Math.max(car.abilActive, 200); car.hp = Math.min(100, car.hp + 50); }
     else if (skillType === 2) { car.abilCD = Math.max(car.abilCD, 600); car.abilActive = Math.max(car.abilActive, 200); }
     else if (skillType === 3) { car.abilCD = Math.max(car.abilCD, 600); car.abilActive = Math.max(car.abilActive, 200); }
