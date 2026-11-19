@@ -88,7 +88,15 @@ app.get('/api/stripe/packs', (req, res) => {
     res.json({ packs: Object.values(STRIPE_PACKS) });
 });
 
+app.options('/api/stripe/create-checkout-session', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.status(204).end();
+});
+
 app.post('/api/stripe/create-checkout-session', async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
     try {
         const stripeSecret = process.env.STRIPE_SECRET_KEY || '';
         if (!stripeSecret) {
