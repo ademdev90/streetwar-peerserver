@@ -456,7 +456,7 @@ function initServerWorld(room, realPlayers, botsCount) {
         const team = mode === 'CTF' ? (redCount <= blueCount ? 'red' : 'blue') : null;
         const pos = getSpawnPosition(team);
         const bName = BOT_NAMES[i] || `Bot_${i + 1}`;
-        const botSec = Math.floor(Math.random() * 6) + 1;
+        const botSec = Math.floor(Math.random() * 7) + 1;
         const botObj = createServerCar(`bot_${i}`, bName, pos.x, pos.y, true, bType, botSec, team, false);
         botObj.angle = Math.atan2(MAP_SIZE / 2 - pos.y, MAP_SIZE / 2 - pos.x);
         cars.push(botObj);
@@ -508,6 +508,7 @@ function createServerCar(uid, name, x, y, isAI, carType, secType, team, hasPass 
         secCD: 0,
         radarTimer: 0,
         visionTimer: 0,
+        trajectoryTimer: 0,
         dualSkillReady: false,
         bonusCarType: -1,
         cdBoostReady: false,
@@ -993,6 +994,7 @@ function updateServerCar(room, car) {
     }
     if (car.blindTimer > 0) car.blindTimer--;
     if (car.visionTimer > 0) car.visionTimer--;
+    if (car.trajectoryTimer > 0) car.trajectoryTimer--;
     if (car.invisTimer > 0) car.invisTimer--;
     if (car.soulReapTimer > 0) car.soulReapTimer--;
 
@@ -1426,7 +1428,7 @@ function serverCarAbility(st, car) {
 function serverCarSecondaryAbility(st, car) {
     if (car.silenceTimer > 0) return;
     const sType = car.secType || 1;
-    car.secCD = (sType === 6) ? 480 : 420;
+    car.secCD = (sType === 7) ? 900 : ((sType === 6) ? 480 : 420);
 
     if (sType === 1) {
         car.radarTimer = 600;
@@ -1461,6 +1463,8 @@ function serverCarSecondaryAbility(st, car) {
         }
     } else if (sType === 6) {
         car.visionTimer = 360;
+    } else if (sType === 7) {
+        car.trajectoryTimer = 360;
     }
 }
 
@@ -1568,7 +1572,7 @@ function buildRoomSnapshot(room, includeStatic = false) {
             angle: Math.round(c.angle * 1000) / 1000, speed: Math.round(c.speed * 100) / 100,
             hp: Math.round(c.hp * 10) / 10, maxHp: c.maxHp, alive: c.alive,
             isAI: c.isAI, carType: c.carType, secType: c.secType || 1, secCD: c.secCD || 0,
-            radarTimer: c.radarTimer || 0, visionTimer: c.visionTimer || 0, dualSkillReady: !!c.dualSkillReady,
+            radarTimer: c.radarTimer || 0, visionTimer: c.visionTimer || 0, trajectoryTimer: c.trajectoryTimer || 0, dualSkillReady: !!c.dualSkillReady,
             bonusCarType: typeof c.bonusCarType === 'number' ? c.bonusCarType : -1, cdBoostReady: !!c.cdBoostReady, team: c.team, hasFlag: c.hasFlag,
             hasPass: !!c.hasPass, isReviving: c.isReviving, respawnTimer: c.respawnTimer,
             stunTimer: c.stunTimer, slowTimer: c.slowTimer || 0,
