@@ -209,6 +209,7 @@ io.on('connection', (socket) => {
         const playerCar = Number.isInteger(data.car) ? data.car : 0;
         const playerSecAbil = Number.isInteger(data.secAbil) ? data.secAbil : 1;
         const playerHasPass = !!data.hasPass;
+        const playerHasAwakening = !!data.hasAwakening;
 
         let targetRoomId = Object.keys(rooms).find(id => {
             const r = rooms[id];
@@ -230,6 +231,7 @@ io.on('connection', (socket) => {
             car: playerCar,
             secAbil: playerSecAbil,
             hasPass: playerHasPass,
+            hasAwakening: playerHasAwakening,
             socket: socket
         });
 
@@ -272,6 +274,7 @@ io.on('connection', (socket) => {
         const playerCar = Number.isInteger(data.car) ? data.car : 0;
         const playerSecAbil = Number.isInteger(data.secAbil) ? data.secAbil : 1;
         const playerHasPass = !!data.hasPass;
+        const playerHasAwakening = !!data.hasAwakening;
 
         const code = generatePrivateCode();
         const roomId = `priv_${code}_${Date.now()}`;
@@ -290,6 +293,7 @@ io.on('connection', (socket) => {
             car: playerCar,
             secAbil: playerSecAbil,
             hasPass: playerHasPass,
+            hasAwakening: playerHasAwakening,
             socket: socket
         });
 
@@ -332,6 +336,7 @@ io.on('connection', (socket) => {
         const playerCar = Number.isInteger(data.car) ? data.car : 0;
         const playerSecAbil = Number.isInteger(data.secAbil) ? data.secAbil : 1;
         const playerHasPass = !!data.hasPass;
+        const playerHasAwakening = !!data.hasAwakening;
 
         socket.join(targetRoomId);
         socket.currentRoomId = targetRoomId;
@@ -342,6 +347,7 @@ io.on('connection', (socket) => {
             car: playerCar,
             secAbil: playerSecAbil,
             hasPass: playerHasPass,
+            hasAwakening: playerHasAwakening,
             socket: socket
         });
 
@@ -483,7 +489,8 @@ function startGame(roomId) {
         name: p.name,
         car: p.car,
         secAbil: p.secAbil || 1,
-        hasPass: !!p.hasPass
+        hasPass: !!p.hasPass,
+        hasAwakening: !!p.hasAwakening
     }));
 
     // إذا كان الروم خاصاً وتم إيقاف البوتات من قِبل صاحب الروم، يكون عدد البوتات 0
@@ -578,7 +585,7 @@ function initServerWorld(room, realPlayers, botsCount) {
     realPlayers.forEach((pData, idx) => {
         const team = mode === 'CTF' ? (idx % 2 === 0 ? 'red' : 'blue') : null;
         const pos = getSpawnPosition(team);
-        const carObj = createServerCar(pData.id, pData.name, pos.x, pos.y, false, pData.car, pData.secAbil, team, !!pData.hasPass);
+        const carObj = createServerCar(pData.id, pData.name, pos.x, pos.y, false, pData.car, pData.secAbil, team, !!pData.hasPass, !!pData.hasAwakening);
         carObj.angle = Math.atan2(MAP_SIZE / 2 - pos.y, MAP_SIZE / 2 - pos.x);
         cars.push(carObj);
     });
@@ -624,7 +631,7 @@ function initServerWorld(room, realPlayers, botsCount) {
     };
 }
 
-function createServerCar(uid, name, x, y, isAI, carType, secType, team, hasPass = false) {
+function createServerCar(uid, name, x, y, isAI, carType, secType, team, hasPass = false, hasAwakening = false) {
     return {
         uid: uid,
         id: name,
@@ -647,6 +654,7 @@ function createServerCar(uid, name, x, y, isAI, carType, secType, team, hasPass 
         bonusCarType: -1,
         cdBoostReady: false,
         hasPass: !!hasPass,
+        hasAwakening: !!hasAwakening,
         w: 38,
         h: 65,
         alive: true,
@@ -655,6 +663,8 @@ function createServerCar(uid, name, x, y, isAI, carType, secType, team, hasPass 
         abilActive: 0,
         shield: 0,
         shieldTimer: 0,
+        healOverTimeRemaining: 0,
+        healOverTimeTick: 0,
         ammo: 12,
         maxAmmo: 12,
         reloadTimer: 0,
@@ -1119,8 +1129,21 @@ function updateServerCar(room, car) {
         if (car.shieldTimer <= 0) {
             car.shield = 0;
         }
-    } else if (car.shield > 0) {
-        car.shield = 0;
+    }
+    if (car.healOverTimeRemaining > 0) {
+        car.healOverTimeRemaining--;
+        car.healOverTimeTick = (car.healOverTimeTick || 0) + 1;
+        if (car.healOverTimeTick >= 60) {
+            car.healOverTimeTick = 0;
+            car.hp = Math.min(car.maxHp, car.hp + 10);
+            if (car.hasAwakening && car.carType === 1 && st.mode === 'CTF' && car.team) {
+                st.cars.forEach(ally => {
+                    if (ally.uid !== car.uid && ally.alive && !ally.isReviving && ally.team === car.team) {
+                        ally.hp = Math.min(ally.maxHp, ally.hp + 10);
+                    }
+                });
+            }
+        }
     }
     if (car.silenceTimer > 0) {
         car.silenceTimer--;
@@ -1260,10 +1283,13 @@ function updateServerCar(room, car) {
     if (car.abilActive > 0) {
         car.abilActive--;
         if (carHasTrait(car, 2)) {
+            const isAwkArc = !!(car.hasAwakening && car.carType === 2);
+            const arcRadius = isAwkArc ? 195 : 125;
+            const arcDmg = isAwkArc ? 0.35 : 0.5;
             st.cars.forEach(c => {
-                if (c.uid !== car.uid && c.alive && !c.isReviving && Math.hypot(c.x - car.x, c.y - car.y) < 150) {
+                if (c.uid !== car.uid && c.alive && !c.isReviving && Math.hypot(c.x - car.x, c.y - car.y) < arcRadius) {
                     if (st.mode === 'CTF' && c.team === car.team) return;
-                    damageServerCar(room, c, 0.5, car);
+                    damageServerCar(room, c, arcDmg, car);
                 }
             });
         }
@@ -1487,7 +1513,7 @@ function serverCarShoot(st, car, customOwnerUid = null) {
 
 function executeServerSkillEffect(st, car, skillType) {
     if (skillType === 0) { car.abilCD = Math.max(car.abilCD, 900); car.shield = 100; car.shieldTimer = 300; }
-    else if (skillType === 1) { car.abilCD = Math.max(car.abilCD, 600); car.abilActive = Math.max(car.abilActive, 200); car.hp = Math.min(car.maxHp, car.hp + 50); }
+    else if (skillType === 1) { car.abilCD = Math.max(car.abilCD, 600); car.abilActive = Math.max(car.abilActive, 300); car.healOverTimeRemaining = 300; car.healOverTimeTick = 0; }
     else if (skillType === 2) { car.abilCD = Math.max(car.abilCD, 600); car.abilActive = Math.max(car.abilActive, 200); }
     else if (skillType === 3) { car.abilCD = Math.max(car.abilCD, 600); car.abilActive = Math.max(car.abilActive, 200); }
     else if (skillType === 4) { car.abilCD = Math.max(car.abilCD, 600); car.abilActive = Math.max(car.abilActive, 300); }
@@ -1504,6 +1530,10 @@ function executeServerSkillEffect(st, car, skillType) {
         car.abilCD = Math.max(car.abilCD, 1200);
         car.x = 200 + Math.random() * (MAP_SIZE - 400);
         car.y = 200 + Math.random() * (MAP_SIZE - 400);
+        if (car.hasAwakening && car.carType === 8) {
+            car.shield = Math.min(100, (car.shield || 0) + 20);
+            car.shieldTimer = 0;
+        }
     }
     else if (skillType === 9) {
         car.abilCD = Math.max(car.abilCD, 900);
@@ -1723,7 +1753,7 @@ function buildRoomSnapshot(room, includeStatic = false) {
             isAI: c.isAI, carType: c.carType, secType: c.secType || 1, secCD: c.secCD || 0,
             radarTimer: c.radarTimer || 0, visionTimer: c.visionTimer || 0, trajectoryTimer: c.trajectoryTimer || 0, dualSkillReady: !!c.dualSkillReady,
             bonusCarType: typeof c.bonusCarType === 'number' ? c.bonusCarType : -1, cdBoostReady: !!c.cdBoostReady, team: c.team, hasFlag: c.hasFlag,
-            hasPass: !!c.hasPass, isReviving: c.isReviving, respawnTimer: c.respawnTimer,
+            hasPass: !!c.hasPass, hasAwakening: !!c.hasAwakening, isReviving: c.isReviving, respawnTimer: c.respawnTimer,
             stunTimer: c.stunTimer, slowTimer: c.slowTimer || 0,
             silenceTimer: c.silenceTimer || 0, blindTimer: c.blindTimer || 0,
             invisTimer: c.invisTimer || 0, hookTimer: c.hookTimer || 0,
