@@ -399,17 +399,54 @@ function initServerWorld(room, realPlayers, botsCount) {
         });
     }
 
+    // نقاط انطلاق محددة ومنظمة للباتل رويال حول الخريطة
+    const BR_SPAWN_SLOTS = [
+        { x: 340,  y: 340 },
+        { x: 2160, y: 340 },
+        { x: 340,  y: 2160 },
+        { x: 2160, y: 2160 },
+        { x: 1250, y: 290 },
+        { x: 1250, y: 2210 },
+        { x: 290,  y: 1250 },
+        { x: 2210, y: 1250 },
+        { x: 760,  y: 760 },
+        { x: 1740, y: 1740 }
+    ];
+    for (let i = BR_SPAWN_SLOTS.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [BR_SPAWN_SLOTS[i], BR_SPAWN_SLOTS[j]] = [BR_SPAWN_SLOTS[j], BR_SPAWN_SLOTS[i]];
+    }
+    let brSlotCursor = 0;
+    const getSpawnPosition = (team) => {
+        if (mode === 'CTF') {
+            return {
+                x: team === 'red' ? 200 + Math.random() * 200 : MAP_SIZE - 400 + Math.random() * 200,
+                y: MAP_SIZE / 2 - 200 + Math.random() * 400
+            };
+        }
+        if (mode === 'BR') {
+            const slot = BR_SPAWN_SLOTS[brSlotCursor % BR_SPAWN_SLOTS.length];
+            brSlotCursor++;
+            for (let oi = obstacles.length - 1; oi >= 0; oi--) {
+                if (Math.hypot(obstacles[oi].x - slot.x, obstacles[oi].y - slot.y) < obstacles[oi].r + 75) {
+                    obstacles.splice(oi, 1);
+                }
+            }
+            return { x: slot.x, y: slot.y };
+        }
+        return {
+            x: 300 + Math.random() * (MAP_SIZE - 600),
+            y: 300 + Math.random() * (MAP_SIZE - 600)
+        };
+    };
+
     const cars = [];
     realPlayers.forEach((pData, idx) => {
         const team = mode === 'CTF' ? (idx % 2 === 0 ? 'red' : 'blue') : null;
-        const sX = mode === 'CTF'
-            ? (team === 'red' ? 200 + Math.random() * 200 : MAP_SIZE - 400 + Math.random() * 200)
-            : 300 + Math.random() * (MAP_SIZE - 600);
-        const sY = mode === 'CTF'
-            ? MAP_SIZE / 2 - 200 + Math.random() * 400
-            : 300 + Math.random() * (MAP_SIZE - 600);
-
-        cars.push(createServerCar(pData.id, pData.name, sX, sY, false, pData.car, pData.secAbil, team, !!pData.hasPass));
+        const pos = getSpawnPosition(team);
+        const carObj = createServerCar(pData.id, pData.name, pos.x, pos.y, false, pData.car, pData.secAbil, team, !!pData.hasPass);
+        carObj.angle = Math.atan2(MAP_SIZE / 2 - pos.y, MAP_SIZE / 2 - pos.x);
+        cars.push(carObj);
     });
 
     for (let i = 0; i < botsCount; i++) {
@@ -417,21 +454,19 @@ function initServerWorld(room, realPlayers, botsCount) {
         const redCount = cars.filter(c => c.team === 'red').length;
         const blueCount = cars.filter(c => c.team === 'blue').length;
         const team = mode === 'CTF' ? (redCount <= blueCount ? 'red' : 'blue') : null;
-        const bX = mode === 'CTF'
-            ? (team === 'red' ? 200 + Math.random() * 200 : MAP_SIZE - 400 + Math.random() * 200)
-            : 300 + Math.random() * (MAP_SIZE - 600);
-        const bY = mode === 'CTF'
-            ? MAP_SIZE / 2 - 200 + Math.random() * 400
-            : 300 + Math.random() * (MAP_SIZE - 600);
+        const pos = getSpawnPosition(team);
         const bName = BOT_NAMES[i] || `Bot_${i + 1}`;
         const botSec = Math.floor(Math.random() * 6) + 1;
-        cars.push(createServerCar(`bot_${i}`, bName, bX, bY, true, bType, botSec, team, false));
+        const botObj = createServerCar(`bot_${i}`, bName, pos.x, pos.y, true, bType, botSec, team, false);
+        botObj.angle = Math.atan2(MAP_SIZE / 2 - pos.y, MAP_SIZE / 2 - pos.x);
+        cars.push(botObj);
     }
 
     room.state = {
         map: mapIndex,
         mode: mode,
         initialCarsCount: cars.length,
+        introTimer: 132,
         timer: 0,
         dmTimer: 180 * 60,
         redScore: 0,
@@ -559,6 +594,11 @@ function driveServerCar(car, control) {
 function simulateRoomStep(room) {
     const st = room.state;
     if (!st) return;
+
+    if (st.introTimer > 0) {
+        st.introTimer--;
+        return;
+    }
 
     st.timer++;
     if (st.mode === 'BR') {
@@ -1509,6 +1549,7 @@ function buildRoomSnapshot(room, includeStatic = false) {
     const snap = {
         map: st.map,
         mode: st.mode,
+        introTimer: st.introTimer || 0,
         timer: st.timer,
         dmTimer: st.dmTimer,
         redScore: st.redScore,
