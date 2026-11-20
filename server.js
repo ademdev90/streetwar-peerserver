@@ -35,6 +35,35 @@ const BOT_NAMES = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot', 'Gol
 let rooms = {};
 let roomSequence = 1;
 
+// نظام البطولة السنوية (7 جانفي من كل عام - 60 لاعباً - 6 مجموعات BR -> CTF 3v3 -> Final DM بدون بوتات)
+const TOURNAMENT_MAX_PLAYERS = 60;
+let championshipData = {
+    seasonYear: Math.max(2026, new Date().getFullYear()),
+    championName: 'Awaiting Champion',
+    registeredPlayers: [], // { uid, name, country, lastCheckInAt, confirmed }
+    stage: 'registration' // 'registration' | 'br_groups' | 'ctf_semis' | 'dm_final' | 'completed'
+};
+
+function buildTournamentBracket(playersList) {
+    const pool = playersList.slice(0, TOURNAMENT_MAX_PLAYERS);
+    const groups = [];
+    for (let i = 0; i < 6; i++) {
+        groups.push({
+            groupIndex: i + 1,
+            mode: 'BR',
+            players: pool.slice(i * 10, (i + 1) * 10)
+        });
+    }
+    return {
+        totalRegistered: pool.length,
+        maxPlayers: TOURNAMENT_MAX_PLAYERS,
+        groups: groups,
+        ctfFinalistsCount: 6,
+        finalDmPlayersCount: 3,
+        finalDmBotsCount: 0
+    };
+}
+
 // تحديد الحد الأقصى للاعبين حسب الطور (6 لاعبين أي 3 ضد 3 في طور سرقة العلم CTF، و10 في البقية)
 function getMaxPlayersForMode(mode) {
     return (mode || 'br').toLowerCase() === 'ctf' ? 6 : 10;
@@ -56,6 +85,56 @@ io.on('connection', (socket) => {
     if (socket.conn && socket.conn.transport && socket.conn.transport.socket) {
         try { socket.conn.transport.socket.setNoDelay(true); } catch (e) {}
     }
+
+    socket.on('getChampionshipInfo', (cb) => {
+        if (typeof cb === 'function') {
+            cb({
+                seasonYear: championshipData.seasonYear,
+                championName: championshipData.championName,
+                registeredCount: championshipData.registeredPlayers.length,
+                maxPlayers: TOURNAMENT_MAX_PLAYERS,
+                stage: championshipData.stage,
+                bracket: buildTournamentBracket(championshipData.registeredPlayers)
+            });
+        }
+    });
+
+    socket.on('registerChampionship', (data = {}, cb) => {
+        if (championshipData.registeredPlayers.length >= TOURNAMENT_MAX_PLAYERS) {
+            if (typeof cb === 'function') cb({ ok: false, message: 'Championship bracket is full (60/60).' });
+            return;
+        }
+        const cleanName = (data.name || 'Player').toString().substring(0, 14);
+        const country = (data.country || 'INTL').toString().substring(0, 8);
+        const existingIdx = championshipData.registeredPlayers.findIndex(p => p.uid === socket.id);
+        const entry = {
+            uid: socket.id,
+            name: cleanName,
+            country: country,
+            lastCheckInAt: Date.now(),
+            confirmed: true
+        };
+        if (existingIdx >= 0) championshipData.registeredPlayers[existingIdx] = entry;
+        else championshipData.registeredPlayers.push(entry);
+
+        if (typeof cb === 'function') {
+            cb({
+                ok: true,
+                registeredCount: championshipData.registeredPlayers.length,
+                maxPlayers: TOURNAMENT_MAX_PLAYERS,
+                bracket: buildTournamentBracket(championshipData.registeredPlayers)
+            });
+        }
+    });
+
+    socket.on('confirmChampionshipCheckIn', (cb) => {
+        const found = championshipData.registeredPlayers.find(p => p.uid === socket.id);
+        if (found) {
+            found.lastCheckInAt = Date.now();
+            found.confirmed = true;
+        }
+        if (typeof cb === 'function') cb({ ok: !!found });
+    });
 
     socket.on('pingCheck', (sentAt, callback) => {
         if (typeof callback === 'function') {
