@@ -44,6 +44,28 @@ let championshipData = {
     stage: 'registration' // 'registration' | 'br_groups' | 'ctf_semis' | 'dm_final' | 'completed'
 };
 
+let serverLeaderboardStore = new Map();
+
+function recordServerLeaderboardEntry(entry) {
+    if (!entry || !entry.uid) return;
+    const prev = serverLeaderboardStore.get(entry.uid) || {
+        uid: entry.uid,
+        name: entry.name || 'Driver',
+        country: entry.country || 'INTL',
+        kills: 0,
+        damage: 0,
+        wins: 0
+    };
+    serverLeaderboardStore.set(entry.uid, {
+        uid: entry.uid,
+        name: entry.name || prev.name || 'Driver',
+        country: entry.country || prev.country || 'INTL',
+        kills: Math.max(prev.kills, 0) + Math.max(0, Math.floor(Number(entry.kills) || 0)),
+        damage: Math.max(prev.damage, 0) + Math.max(0, Math.floor(Number(entry.damage) || 0)),
+        wins: Math.max(prev.wins, 0) + Math.max(0, Math.floor(Number(entry.wins) || 0))
+    });
+}
+
 function buildTournamentBracket(playersList) {
     const pool = playersList.slice(0, TOURNAMENT_MAX_PLAYERS);
     const groups = [];
@@ -85,6 +107,39 @@ io.on('connection', (socket) => {
     if (socket.conn && socket.conn.transport && socket.conn.transport.socket) {
         try { socket.conn.transport.socket.setNoDelay(true); } catch (e) {}
     }
+
+    socket.on('submitLeaderboardStats', (data = {}, cb) => {
+        const uid = (data.uid || socket.id).toString().substring(0, 80);
+        recordServerLeaderboardEntry({
+            uid: uid,
+            name: (data.name || 'Driver').toString().substring(0, 16),
+            country: (data.country || 'INTL').toString().substring(0, 8),
+            kills: Number(data.kills) || 0,
+            damage: Number(data.damage) || 0,
+            wins: Number(data.wins) || 0
+        });
+        if (typeof cb === 'function') cb({ ok: true });
+    });
+
+    socket.on('getLeaderboardData', (data = {}, cb) => {
+        if (data && data.selfEntry && data.selfEntry.uid) {
+            const existing = serverLeaderboardStore.get(data.selfEntry.uid);
+            if (!existing) {
+                recordServerLeaderboardEntry(data.selfEntry);
+            } else {
+                serverLeaderboardStore.set(data.selfEntry.uid, {
+                    ...existing,
+                    name: data.selfEntry.name || existing.name,
+                    country: data.selfEntry.country || existing.country,
+                    kills: Math.max(existing.kills, Math.floor(Number(data.selfEntry.kills) || 0)),
+                    damage: Math.max(existing.damage, Math.floor(Number(data.selfEntry.damage) || 0)),
+                    wins: Math.max(existing.wins, Math.floor(Number(data.selfEntry.wins) || 0))
+                });
+            }
+        }
+        const entries = Array.from(serverLeaderboardStore.values());
+        if (typeof cb === 'function') cb({ entries });
+    });
 
     socket.on('getChampionshipInfo', (cb) => {
         if (typeof cb === 'function') {
@@ -1613,6 +1668,21 @@ function finishServerMatch(room) {
     if (room.netInterval) clearInterval(room.netInterval);
 
     const finalSnap = buildRoomSnapshot(room, false);
+    if (room.state && Array.isArray(room.state.cars)) {
+        const sortedByKills = [...room.state.cars].sort((a, b) => (b.kills || 0) - (a.kills || 0));
+        room.state.cars.forEach((c, idx) => {
+            if (!c || c.isAI) return;
+            const rankNum = c.rank || (idx + 1);
+            recordServerLeaderboardEntry({
+                uid: c.uid,
+                name: c.id || 'Driver',
+                country: c.country || 'INTL',
+                kills: Math.floor(Number(c.kills) || 0),
+                damage: Math.floor(Number(c.dmgDealt) || 0),
+                wins: rankNum === 1 ? 1 : 0
+            });
+        });
+    }
     io.to(room.id).emit('matchEnded', { state: finalSnap });
 
     room.players.forEach(p => {
