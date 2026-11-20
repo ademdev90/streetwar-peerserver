@@ -1,12 +1,17 @@
 {
-  "name": "streetwar-peerserver",
+  "name": "battlecars",
   "version": "1.0.0",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "description": "",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
   "dependencies": {
-    "express": "^4.18.2",
-    "socket.io": "^4.6.1"
-  }
+    "@netlify/database": "^2.0.1",
+    "drizzle-orm": "^1.0.0-beta.22"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^1.0.0-beta.22"
+  },
+  "private": true
 }
