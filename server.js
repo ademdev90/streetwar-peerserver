@@ -103,7 +103,17 @@ function generatePrivateCode() {
     return code;
 }
 
+function broadcastOnlinePlayersCount() {
+    const count = Math.max(1, io.engine ? io.engine.clientsCount : 1);
+    io.emit('onlinePlayersCount', { count });
+}
+
 io.on('connection', (socket) => {
+    broadcastOnlinePlayersCount();
+    socket.on('getOnlinePlayersCount', (cb) => {
+        const count = Math.max(1, io.engine ? io.engine.clientsCount : 1);
+        if (typeof cb === 'function') cb({ count });
+    });
     if (socket.conn && socket.conn.transport && socket.conn.transport.socket) {
         try { socket.conn.transport.socket.setNoDelay(true); } catch (e) {}
     }
@@ -409,6 +419,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
+        setTimeout(broadcastOnlinePlayersCount, 120);
         leaveRoom(socket);
     });
 });
@@ -591,7 +602,7 @@ function initServerWorld(room, realPlayers, botsCount) {
     });
 
     for (let i = 0; i < botsCount; i++) {
-        const bType = Math.floor(Math.random() * 17);
+        const bType = Math.floor(Math.random() * 18);
         const redCount = cars.filter(c => c.team === 'red').length;
         const blueCount = cars.filter(c => c.team === 'blue').length;
         const team = mode === 'CTF' ? (redCount <= blueCount ? 'red' : 'blue') : null;
@@ -671,6 +682,8 @@ function createServerCar(uid, name, x, y, isAI, carType, secType, team, hasPass 
         stunTimer: 0,
         slowTimer: 0,
         silenceTimer: 0,
+        curseTimer: 0,
+        cursedByUid: null,
         blindTimer: 0,
         invisTimer: 0,
         hookTimer: 0,
@@ -989,6 +1002,25 @@ function simulateRoomStep(room) {
 
         b.x += b.vx;
         b.y += b.vy;
+        b.distanceTraveled = (b.distanceTraveled || 0) + Math.hypot(b.vx, b.vy);
+
+        if (b.bouncesLeft > 0) {
+            let bouncedWall = false;
+            if (b.x <= 8 || b.x >= MAP_SIZE - 8) {
+                b.vx = -b.vx;
+                b.x = Math.max(10, Math.min(MAP_SIZE - 10, b.x));
+                bouncedWall = true;
+            }
+            if (b.y <= 8 || b.y >= MAP_SIZE - 8) {
+                b.vy = -b.vy;
+                b.y = Math.max(10, Math.min(MAP_SIZE - 10, b.y));
+                bouncedWall = true;
+            }
+            if (bouncedWall) {
+                b.bouncesLeft--;
+                b.angle = Math.atan2(b.vy, b.vx);
+            }
+        }
 
         for (const w of st.walls) {
             if (b.ownerUid !== w.ownerUid) {
@@ -1013,9 +1045,27 @@ function simulateRoomStep(room) {
             }
         }
 
-        let hit = st.obstacles.some(o => Math.hypot(b.x - o.x, b.y - o.y) < o.r);
+        let hit = false;
+        const hitObs = st.obstacles.find(o => Math.hypot(b.x - o.x, b.y - o.y) < o.r);
+        if (hitObs) {
+            if (b.bouncesLeft > 0) {
+                const dObs = Math.max(1, Math.hypot(b.x - hitObs.x, b.y - hitObs.y));
+                const nx = (b.x - hitObs.x) / dObs;
+                const ny = (b.y - hitObs.y) / dObs;
+                const dot = b.vx * nx + b.vy * ny;
+                b.vx = b.vx - 2 * dot * nx;
+                b.vy = b.vy - 2 * dot * ny;
+                b.angle = Math.atan2(b.vy, b.vx);
+                b.x = hitObs.x + nx * (hitObs.r + 6);
+                b.y = hitObs.y + ny * (hitObs.r + 6);
+                b.bouncesLeft--;
+            } else {
+                hit = true;
+            }
+        }
+
         if (!hit) {
-            const hitRadius = b.isEmpArc ? 38 : (b.isHook ? 36 : (b.isHackArrow ? 32 : 28));
+            const hitRadius = b.isEmpArc ? 38 : (b.isHook ? 36 : (b.isCurseOrb ? 34 : (b.isHackArrow ? 32 : 28)));
             const ignoreUid = b.sourceUid || b.ownerUid;
             const target = st.cars.find(c =>
                 c.alive && !c.isReviving &&
@@ -1024,13 +1074,28 @@ function simulateRoomStep(room) {
                 (st.mode !== 'CTF' || !ownerCar || c.team !== ownerCar.team)
             );
             if (target) {
-                if (b.isHeart) {
+                const distRatio = Math.min(1, (b.distanceTraveled || 0) / 1100);
+                const falloffMult = 1 - (distRatio * 0.55);
+                const applyServerScaledDmg = (victim, baseAmt, atkCar) => {
+                    const scaledDmg = Math.max(1, Math.round(baseAmt * falloffMult));
+                    if (atkCar && atkCar.alive && atkCar.curseTimer > 0) {
+                        const curseCaster = st.cars.find(c => c.uid === atkCar.cursedByUid) || victim;
+                        damageServerCar(room, atkCar, scaledDmg, curseCaster);
+                    } else {
+                        damageServerCar(room, victim, scaledDmg, atkCar);
+                    }
+                };
+
+                if (b.isCurseOrb) {
+                    target.curseTimer = 600;
+                    target.cursedByUid = ownerCar ? ownerCar.uid : b.ownerUid;
+                } else if (b.isHeart) {
                     target.stunTimer = 180;
                 } else if (b.isEmpArc) {
                     target.silenceTimer = 300;
                     target.abilActive = 0;
                     target.invisTimer = 0;
-                    damageServerCar(room, target, b.dmg || 15, ownerCar);
+                    applyServerScaledDmg(target, b.dmg || 15, ownerCar);
                 } else if (b.isHackArrow) {
                     if (ownerCar && ownerCar.alive && !ownerCar.isReviving) {
                         clearServerMindControlLinks(st, ownerCar);
@@ -1040,7 +1105,7 @@ function simulateRoomStep(room) {
                         target.controlledByUid = ownerCar.uid;
                         target.mindControlTimer = 600;
                     }
-                    damageServerCar(room, target, b.dmg || 10, ownerCar);
+                    applyServerScaledDmg(target, b.dmg || 10, ownerCar);
                 } else if (b.isHook) {
                     if (ownerCar && ownerCar.alive && !ownerCar.isReviving) {
                         ownerCar.hookTimer = 28;
@@ -1048,9 +1113,9 @@ function simulateRoomStep(room) {
                         ownerCar.hookPullSelf = (ownerCar.hp < target.hp);
                         target.stunTimer = Math.max(target.stunTimer || 0, 28);
                     }
-                    damageServerCar(room, target, b.dmg || 15, ownerCar);
+                    applyServerScaledDmg(target, b.dmg || 15, ownerCar);
                 } else {
-                    damageServerCar(room, target, b.dmg, ownerCar);
+                    applyServerScaledDmg(target, b.dmg, ownerCar);
                 }
                 hit = true;
             }
@@ -1145,6 +1210,10 @@ function updateServerCar(room, car) {
             }
         }
     }
+    if (car.curseTimer > 0) {
+        car.curseTimer--;
+        if (car.curseTimer <= 0) car.cursedByUid = null;
+    }
     if (car.silenceTimer > 0) {
         car.silenceTimer--;
         car.invisTimer = 0;
@@ -1228,11 +1297,12 @@ function updateServerCar(room, car) {
             car.reloadTimer = 90;
         }
         if (ctrl.shoot && car.shootCD <= 0 && car.reloadTimer <= 0) {
-            if (car.ammo > 0) {
+            const ammoNeeded = (car.carType === 17) ? 2 : 1;
+            if (car.ammo >= ammoNeeded) {
                 serverCarShoot(st, car, activeController.uid);
-                car.ammo--;
+                car.ammo -= ammoNeeded;
                 car.shootCD = 12;
-                if (car.ammo <= 0) car.reloadTimer = 90;
+                if (car.ammo < ammoNeeded) car.reloadTimer = 90;
             } else {
                 car.reloadTimer = 90;
             }
@@ -1254,11 +1324,12 @@ function updateServerCar(room, car) {
             car.reloadTimer = 90;
         }
         if (control.shoot && car.shootCD <= 0 && car.reloadTimer <= 0) {
-            if (car.ammo > 0) {
+            const ammoNeeded = (car.carType === 17) ? 2 : 1;
+            if (car.ammo >= ammoNeeded) {
                 serverCarShoot(st, car);
-                car.ammo--;
+                car.ammo -= ammoNeeded;
                 car.shootCD = 12;
-                if (car.ammo <= 0) car.reloadTimer = 90;
+                if (car.ammo < ammoNeeded) car.reloadTimer = 90;
             } else {
                 car.reloadTimer = 90;
             }
@@ -1464,11 +1535,12 @@ function updateServerBotAI(st, car) {
     }
 }
 
-function createServerBullet(st, car, angOffset, isHeart = false, customDmg = null, isSniper = false, isEmpArc = false, isHackArrow = false, customOwnerUid = null, isHook = false) {
+function createServerBullet(st, car, angOffset, isHeart = false, customDmg = null, isSniper = false, isEmpArc = false, isHackArrow = false, customOwnerUid = null, isHook = false, extraOpts = null) {
+    const opts = extraOpts || {};
     let shootAngle = car.angle + angOffset;
     const dmg = isHeart ? 0 : (customDmg !== null ? customDmg : 18);
 
-    if (carHasTrait(car, 4) && car.abilActive > 0 && !isHeart && !isHackArrow && !isEmpArc && !isHook) {
+    if (carHasTrait(car, 4) && car.abilActive > 0 && !isHeart && !isHackArrow && !isEmpArc && !isHook && !opts.isCurseOrb) {
         let closest = null, minDist = Infinity;
         st.cars.forEach(c => {
             if (c.uid !== car.uid && c.alive && !c.isReviving) {
@@ -1482,10 +1554,13 @@ function createServerBullet(st, car, angOffset, isHeart = false, customDmg = nul
         }
     }
 
-    const speed = isHeart ? 10 : (isSniper ? 22 : (isHook ? 21 : (isHackArrow ? 18 : (isEmpArc ? 15 : 16))));
+    const speed = isHeart ? 10 : (isSniper ? 22 : (isHook ? 21 : (opts.isCurseOrb ? 17 : (isHackArrow ? 18 : (isEmpArc ? 15 : 16)))));
+    const perpAngle = shootAngle + Math.PI / 2;
+    const lat = opts.lateralOffset || 0;
     st.bullets.push({
-        x: car.x + Math.cos(shootAngle) * 28,
-        y: car.y + Math.sin(shootAngle) * 28,
+        x: car.x + Math.cos(shootAngle) * 28 + Math.cos(perpAngle) * lat,
+        y: car.y + Math.sin(shootAngle) * 28 + Math.sin(perpAngle) * lat,
+        distanceTraveled: 0,
         vx: Math.round(Math.cos(shootAngle) * speed * 100) / 100,
         vy: Math.round(Math.sin(shootAngle) * speed * 100) / 100,
         angle: Math.round(shootAngle * 1000) / 1000,
@@ -1496,7 +1571,10 @@ function createServerBullet(st, car, angOffset, isHeart = false, customDmg = nul
         isSniper: isSniper,
         isEmpArc: isEmpArc,
         isHackArrow: isHackArrow,
-        isHook: isHook
+        isHook: isHook,
+        isDarkLightBeam: !!opts.isDarkLightBeam,
+        bouncesLeft: opts.bouncesLeft || 0,
+        isCurseOrb: !!opts.isCurseOrb
     });
 }
 
@@ -1504,7 +1582,12 @@ function serverCarShoot(st, car, customOwnerUid = null) {
     if (car.invisTimer > 0) {
         car.invisTimer = 0;
     }
-    createServerBullet(st, car, 0, false, null, false, false, false, customOwnerUid, false);
+    if (car.carType === 17) {
+        createServerBullet(st, car, 0, false, 11, false, false, false, customOwnerUid, false, { isDarkLightBeam: true, bouncesLeft: 3, lateralOffset: -11 });
+        createServerBullet(st, car, 0, false, 11, false, false, false, customOwnerUid, false, { isDarkLightBeam: true, bouncesLeft: 3, lateralOffset: 11 });
+    } else {
+        createServerBullet(st, car, 0, false, null, false, false, false, customOwnerUid, false);
+    }
     if (carHasTrait(car, 3) && car.abilActive > 0) {
         createServerBullet(st, car, 0.2, false, null, false, false, false, customOwnerUid);
         createServerBullet(st, car, -0.2, false, null, false, false, false, customOwnerUid);
@@ -1568,6 +1651,10 @@ function executeServerSkillEffect(st, car, skillType) {
         car.drillTimer = 55;
         car.drillHitUids = [];
     }
+    else if (skillType === 17) {
+        car.abilCD = Math.max(car.abilCD, 1800);
+        createServerBullet(st, car, 0, false, 0, false, false, false, null, false, { isCurseOrb: true });
+    }
 }
 
 function serverCarAbility(st, car) {
@@ -1577,7 +1664,7 @@ function serverCarAbility(st, car) {
 
     if (car.dualSkillReady) {
         car.dualSkillReady = false;
-        const pool = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].filter(t => t !== car.carType);
+        const pool = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17].filter(t => t !== car.carType);
         const randomSkill = pool[Math.floor(Math.random() * pool.length)];
         car.bonusCarType = randomSkill;
         executeServerSkillEffect(st, car, randomSkill);
@@ -1755,7 +1842,7 @@ function buildRoomSnapshot(room, includeStatic = false) {
             bonusCarType: typeof c.bonusCarType === 'number' ? c.bonusCarType : -1, cdBoostReady: !!c.cdBoostReady, team: c.team, hasFlag: c.hasFlag,
             hasPass: !!c.hasPass, hasAwakening: !!c.hasAwakening, isReviving: c.isReviving, respawnTimer: c.respawnTimer,
             stunTimer: c.stunTimer, slowTimer: c.slowTimer || 0,
-            silenceTimer: c.silenceTimer || 0, blindTimer: c.blindTimer || 0,
+            silenceTimer: c.silenceTimer || 0, curseTimer: c.curseTimer || 0, blindTimer: c.blindTimer || 0,
             invisTimer: c.invisTimer || 0, hookTimer: c.hookTimer || 0,
             hookTargetUid: c.hookTargetUid || null,
             soulReapTimer: c.soulReapTimer || 0, drillTimer: c.drillTimer || 0,
@@ -1777,7 +1864,7 @@ function buildRoomSnapshot(room, includeStatic = false) {
             x: Math.round(b.x), y: Math.round(b.y),
             vx: b.vx, vy: b.vy, angle: b.angle || 0,
             isHeart: !!b.isHeart, isSniper: !!b.isSniper,
-            isEmpArc: !!b.isEmpArc, isHackArrow: !!b.isHackArrow, isHook: !!b.isHook
+            isEmpArc: !!b.isEmpArc, isHackArrow: !!b.isHackArrow, isHook: !!b.isHook, isDarkLightBeam: !!b.isDarkLightBeam, isCurseOrb: !!b.isCurseOrb
         }))
     };
 
