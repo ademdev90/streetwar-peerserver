@@ -43,29 +43,55 @@ function cleanupExpiredVerificationCodes() {
     }
 }
 
-async function dispatchVerificationEmail(toEmail, code) {
+let cachedMailTransporter = null;
+let cachedMailSignature = '';
+
+function getOrCreateMailTransporter() {
     const smtpUser = (process.env.SMTP_USER || process.env.GMAIL_USER || '').trim();
-    const smtpPass = (process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD || '').trim();
+    const smtpPass = (process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '').trim();
     const smtpHost = (process.env.SMTP_HOST || 'smtp.gmail.com').trim();
-    const smtpPort = parseInt(process.env.SMTP_PORT || '465', 10) || 465;
+    const smtpPort = parseInt(process.env.SMTP_PORT || '587', 10) || 587;
 
     if (!smtpUser || !smtpPass) {
-        return { sent: false, reason: 'SMTP_NOT_CONFIGURED' };
+        return { error: 'SMTP_NOT_CONFIGURED' };
     }
 
     let nodemailer = null;
     try {
         nodemailer = require('nodemailer');
     } catch (e) {
-        return { sent: false, reason: 'NODEMAILER_MISSING' };
+        return { error: 'NODEMAILER_MISSING' };
     }
 
-    const transporter = nodemailer.createTransport({
-        host: smtpHost,
-        port: smtpPort,
-        secure: smtpPort === 465,
-        auth: { user: smtpUser, pass: smtpPass }
-    });
+    const sig = `${smtpHost}:${smtpPort}:${smtpUser}:${smtpPass.slice(0, 4)}`;
+    if (!cachedMailTransporter || cachedMailSignature !== sig) {
+        cachedMailTransporter = nodemailer.createTransport({
+            host: smtpHost,
+            port: smtpPort,
+            secure: smtpPort === 465,
+            pool: true,
+            maxConnections: 3,
+            maxMessages: 50,
+            family: 4,
+            connectionTimeout: 10000,
+            greetingTimeout: 10000,
+            socketTimeout: 15000,
+            tls: {
+                rejectUnauthorized: false
+            },
+            auth: { user: smtpUser, pass: smtpPass }
+        });
+        cachedMailSignature = sig;
+    }
+
+    return { transporter: cachedMailTransporter, smtpUser };
+}
+
+async function dispatchVerificationEmail(toEmail, code) {
+    const setup = getOrCreateMailTransporter();
+    if (setup.error) {
+        return { sent: false, reason: setup.error };
+    }
 
     const htmlBody = `
         <div style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; background: #0b1220; color: #f8fafc; border: 2px solid #00d4ff; border-radius: 14px; padding: 24px; text-align: center;">
@@ -82,15 +108,25 @@ async function dispatchVerificationEmail(toEmail, code) {
         </div>
     `;
 
-    await transporter.sendMail({
-        from: `"Street War Battle Cars" <${smtpUser}>`,
+    const mailOptions = {
+        from: `"Street War Battle Cars" <${setup.smtpUser}>`,
         to: toEmail,
         subject: `${code} is your Street War verification code`,
         text: `Your Street War Battle Cars verification code is: ${code} (valid for 10 minutes).`,
         html: htmlBody
-    });
+    };
 
-    return { sent: true };
+    try {
+        await setup.transporter.sendMail(mailOptions);
+        return { sent: true };
+    } catch (firstErr) {
+        // Reset pooled transporter and retry once immediately on transient SMTP socket close
+        cachedMailTransporter = null;
+        const retrySetup = getOrCreateMailTransporter();
+        if (retrySetup.error) throw firstErr;
+        await retrySetup.transporter.sendMail(mailOptions);
+        return { sent: true };
+    }
 }
 
 app.post('/api/send-verification-code', async (req, res) => {
@@ -103,8 +139,8 @@ app.post('/api/send-verification-code', async (req, res) => {
 
     const existing = emailVerificationStore.get(email);
     const now = Date.now();
-    if (existing && existing.lastSentAt && (now - existing.lastSentAt) < 25000) {
-        const waitSec = Math.ceil((25000 - (now - existing.lastSentAt)) / 1000);
+    if (existing && existing.lastSentAt && (now - existing.lastSentAt) < 10000) {
+        const waitSec = Math.ceil((10000 - (now - existing.lastSentAt)) / 1000);
         return res.status(429).json({ ok: false, error: 'RATE_LIMITED', message: `Please wait ${waitSec}s before requesting another code.` });
     }
 
@@ -120,6 +156,7 @@ app.post('/api/send-verification-code', async (req, res) => {
     try {
         const mailRes = await dispatchVerificationEmail(email, code);
         if (!mailRes.sent) {
+            emailVerificationStore.delete(email);
             return res.status(503).json({
                 ok: false,
                 error: mailRes.reason || 'EMAIL_SERVICE_UNAVAILABLE',
@@ -128,11 +165,13 @@ app.post('/api/send-verification-code', async (req, res) => {
         }
         return res.json({ ok: true, message: 'Verification code sent to your email inbox!' });
     } catch (err) {
-        console.error('Failed to send verification email:', err && err.message ? err.message : err);
+        emailVerificationStore.delete(email);
+        const errDetail = (err && (err.responseCode || err.code || err.message)) ? String(err.responseCode || err.code || err.message) : 'SMTP_ERROR';
+        console.error('Failed to send verification email:', errDetail);
         return res.status(500).json({
             ok: false,
             error: 'SMTP_SEND_FAILED',
-            message: 'Could not send email right now. Please check email address or try again.'
+            message: `Temporary email server delay (${errDetail}). Click Resend Code to retry.`
         });
     }
 });
