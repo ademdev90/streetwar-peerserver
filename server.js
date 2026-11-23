@@ -3,6 +3,14 @@ const http = require('http');
 const { Server } = require('socket.io');
 
 const app = express();
+app.use(express.json({ limit: '64kb' }));
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+});
 const server = http.createServer(app);
 
 server.on('connection', (tcpSocket) => {
@@ -21,6 +29,144 @@ const io = new Server(server, {
 app.get('/ping', (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.status(200).send('Server is active');
+});
+
+// ================= Real Email Verification Code Endpoints =================
+const emailVerificationStore = new Map(); // email -> { code, expiresAt, verified, attempts, lastSentAt }
+
+function cleanupExpiredVerificationCodes() {
+    const now = Date.now();
+    for (const [k, entry] of emailVerificationStore.entries()) {
+        if (!entry || now > entry.expiresAt + 10 * 60 * 1000) {
+            emailVerificationStore.delete(k);
+        }
+    }
+}
+
+async function dispatchVerificationEmail(toEmail, code) {
+    const smtpUser = (process.env.SMTP_USER || process.env.GMAIL_USER || '').trim();
+    const smtpPass = (process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD || '').trim();
+    const smtpHost = (process.env.SMTP_HOST || 'smtp.gmail.com').trim();
+    const smtpPort = parseInt(process.env.SMTP_PORT || '465', 10) || 465;
+
+    if (!smtpUser || !smtpPass) {
+        return { sent: false, reason: 'SMTP_NOT_CONFIGURED' };
+    }
+
+    let nodemailer = null;
+    try {
+        nodemailer = require('nodemailer');
+    } catch (e) {
+        return { sent: false, reason: 'NODEMAILER_MISSING' };
+    }
+
+    const transporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: smtpPort,
+        secure: smtpPort === 465,
+        auth: { user: smtpUser, pass: smtpPass }
+    });
+
+    const htmlBody = `
+        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; background: #0b1220; color: #f8fafc; border: 2px solid #00d4ff; border-radius: 14px; padding: 24px; text-align: center;">
+            <h2 style="color: #00d4ff; margin: 0 0 8px;">🏎️ STREET WAR BATTLE CARS</h2>
+            <p style="color: #cbd5e1; font-size: 14px; margin: 0 0 18px;">
+                Use the verification code below to confirm your email address and complete registration:
+            </p>
+            <div style="font-size: 32px; font-weight: 900; letter-spacing: 6px; color: #00ffaa; background: #0f1f36; border: 1.5px dashed #00ffaa; border-radius: 10px; padding: 14px 18px; margin-bottom: 16px;">
+                ${code}
+            </div>
+            <p style="color: #94a3b8; font-size: 12px; margin: 0;">
+                This code expires in <b>10 minutes</b>. If you did not request this code, you can ignore this email.
+            </p>
+        </div>
+    `;
+
+    await transporter.sendMail({
+        from: `"Street War Battle Cars" <${smtpUser}>`,
+        to: toEmail,
+        subject: `${code} is your Street War verification code`,
+        text: `Your Street War Battle Cars verification code is: ${code} (valid for 10 minutes).`,
+        html: htmlBody
+    });
+
+    return { sent: true };
+}
+
+app.post('/api/send-verification-code', async (req, res) => {
+    cleanupExpiredVerificationCodes();
+    const rawEmail = (req.body && req.body.email) ? String(req.body.email) : '';
+    const email = rawEmail.trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ ok: false, error: 'INVALID_EMAIL', message: 'Please enter a valid email address.' });
+    }
+
+    const existing = emailVerificationStore.get(email);
+    const now = Date.now();
+    if (existing && existing.lastSentAt && (now - existing.lastSentAt) < 25000) {
+        const waitSec = Math.ceil((25000 - (now - existing.lastSentAt)) / 1000);
+        return res.status(429).json({ ok: false, error: 'RATE_LIMITED', message: `Please wait ${waitSec}s before requesting another code.` });
+    }
+
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    emailVerificationStore.set(email, {
+        code,
+        expiresAt: now + 10 * 60 * 1000,
+        verified: false,
+        attempts: 0,
+        lastSentAt: now
+    });
+
+    try {
+        const mailRes = await dispatchVerificationEmail(email, code);
+        if (!mailRes.sent) {
+            return res.status(503).json({
+                ok: false,
+                error: mailRes.reason || 'EMAIL_SERVICE_UNAVAILABLE',
+                message: 'Email server not configured yet on Render (add SMTP_USER & SMTP_PASS).'
+            });
+        }
+        return res.json({ ok: true, message: 'Verification code sent to your email inbox!' });
+    } catch (err) {
+        console.error('Failed to send verification email:', err && err.message ? err.message : err);
+        return res.status(500).json({
+            ok: false,
+            error: 'SMTP_SEND_FAILED',
+            message: 'Could not send email right now. Please check email address or try again.'
+        });
+    }
+});
+
+app.post('/api/verify-email-code', (req, res) => {
+    cleanupExpiredVerificationCodes();
+    const email = ((req.body && req.body.email) ? String(req.body.email) : '').trim().toLowerCase();
+    const code = ((req.body && req.body.code) ? String(req.body.code) : '').trim();
+
+    if (!email || !code) {
+        return res.status(400).json({ ok: false, message: 'Email and verification code are required.' });
+    }
+
+    const record = emailVerificationStore.get(email);
+    if (!record) {
+        return res.status(400).json({ ok: false, message: 'No verification code found for this email. Click Verify Email first.' });
+    }
+    if (Date.now() > record.expiresAt) {
+        emailVerificationStore.delete(email);
+        return res.status(400).json({ ok: false, message: 'Verification code expired. Please request a new code.' });
+    }
+
+    record.attempts = (record.attempts || 0) + 1;
+    if (record.attempts > 6) {
+        emailVerificationStore.delete(email);
+        return res.status(429).json({ ok: false, message: 'Too many wrong attempts. Please request a new code.' });
+    }
+
+    if (record.code !== code) {
+        return res.status(400).json({ ok: false, message: 'Incorrect verification code. Check your email inbox.' });
+    }
+
+    record.verified = true;
+    return res.json({ ok: true, verified: true, message: 'Email verified successfully!' });
 });
 
 app.get('/', (req, res) => {
