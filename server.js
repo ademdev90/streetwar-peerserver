@@ -2099,17 +2099,19 @@ function leaveRoom(socket) {
 // ================= Polar.sh Checkout & Webhook Gem Delivery =================
 const crypto = require('crypto');
 
-const POLAR_GEM_PACKS = {
+const POLAR_GEM_PACKS = Object.freeze({
     'a270d8d4-e2f4-4aff-afc3-401d1ca4e52a': { gems: 100,   priceUsd: '0.99',  label: '100 Gems Pack' },
     'cf3ba177-b737-457d-9aab-c4602940f81a': { gems: 550,   priceUsd: '4.99',  label: '550 Gems Pack' },
     '549c7806-997f-4139-a14b-36469928635c': { gems: 1200,  priceUsd: '9.99',  label: '1200 Gems Pack' },
     '331ff154-1e9f-4b6c-aa2b-85f91aa881f6': { gems: 2600,  priceUsd: '19.99', label: '2600 Gems Pack' },
     '1bdfbc13-d26e-4384-a4a6-6720137c45cc': { gems: 6800,  priceUsd: '49.99', label: '6800 Gems Pack' },
     'e8352f00-80e0-443b-a924-5a68395a83d8': { gems: 14500, priceUsd: '99.99', label: '14500 Gems Pack' }
-};
+});
 
 const processedPolarOrders = new Set();
-const pendingPolarGemClaims = new Map(); // accountKey -> [{ orderId, gems, label, claimedAt }]
+const inFlightPolarOrders = new Set();
+const pendingPolarGemClaims = new Map(); // accountKey -> [{ orderId, productId, gems, label, ts }]
+const claimedPolarOrderIds = new Set();
 
 let polarAdminDb = null;
 function getPolarFirestoreAdmin() {
@@ -2193,10 +2195,9 @@ app.post('/api/polar/create-checkout', async (req, res) => {
 
 function verifyPolarWebhookSignature(rawBodyStr, headers) {
     const secret = (process.env.POLAR_WEBHOOK_SECRET || '').trim();
-    if (!secret) return true; // If not set yet, allow payload parsing while warning in logs
+    if (!secret) return true;
     if (!rawBodyStr) return false;
 
-    // Standard Webhooks / Svix signature headers or HMAC hex
     const webhookId = headers['webhook-id'] || headers['svix-id'] || '';
     const webhookTs = headers['webhook-timestamp'] || headers['svix-timestamp'] || '';
     const webhookSig = headers['webhook-signature'] || headers['svix-signature'] || headers['x-polar-signature'] || '';
@@ -2235,68 +2236,135 @@ app.post('/api/polar/webhook', express.raw({ type: '*/*', limit: '256kb' }), asy
     const eventType = payload && payload.type ? String(payload.type) : '';
     const dataObj = (payload && payload.data) ? payload.data : {};
 
-    const isPaidEvent = (
-        eventType === 'order.paid' ||
-        eventType === 'checkout.updated' && (dataObj.status === 'succeeded' || dataObj.status === 'confirmed')
-    );
-
-    if (!isPaidEvent) {
+    // Strictly fulfill ONLY on 'order.paid' so checkout.updated never double-credits the same purchase
+    if (eventType !== 'order.paid') {
         return res.json({ ok: true, ignored: true, eventType });
     }
 
-    const orderId = String(dataObj.id || dataObj.order_id || dataObj.checkout_id || '').trim();
-    if (orderId && processedPolarOrders.has(orderId)) {
-        return res.json({ ok: true, duplicate: true, orderId });
+    const orderId = String(dataObj.id || dataObj.order_id || '').trim();
+    const checkoutId = String(dataObj.checkout_id || (dataObj.checkout && dataObj.checkout.id) || '').trim();
+    const dedupeKey = orderId || checkoutId;
+
+    if (!dedupeKey) {
+        console.warn('Polar order.paid missing order id');
+        return res.status(400).json({ ok: false, message: 'Missing order id.' });
+    }
+
+    if (processedPolarOrders.has(dedupeKey) || inFlightPolarOrders.has(dedupeKey) || (checkoutId && processedPolarOrders.has(checkoutId))) {
+        return res.json({ ok: true, duplicate: true, orderId: dedupeKey });
     }
 
     const meta = (dataObj.metadata && typeof dataObj.metadata === 'object')
         ? dataObj.metadata
         : ((dataObj.checkout && dataObj.checkout.metadata) ? dataObj.checkout.metadata : {});
 
-    const productId = String(dataObj.product_id || (dataObj.product && dataObj.product.id) || meta.productId || '').trim();
+    // Resolve productId strictly from Polar order/product fields first, then metadata
+    let productId = String(dataObj.product_id || (dataObj.product && dataObj.product.id) || '').trim();
+    if (!productId && Array.isArray(dataObj.items) && dataObj.items.length > 0) {
+        const firstItem = dataObj.items[0] || {};
+        productId = String(firstItem.product_id || (firstItem.product && firstItem.product.id) || '').trim();
+    }
+    if (!productId && meta.productId) {
+        productId = String(meta.productId).trim();
+    }
+
     const pack = POLAR_GEM_PACKS[productId];
-    const gemsAmount = pack ? pack.gems : (parseInt(meta.gems || '0', 10) || 0);
+    if (!pack) {
+        console.warn('Polar order.paid unknown productId:', { orderId: dedupeKey, productId, meta });
+        return res.json({ ok: true, warning: 'Unknown productId', productId });
+    }
+
+    // Exact 1x face-value gem amount from POLAR_GEM_PACKS (never multiplied by quantity or duplicate events)
+    const gemsAmount = pack.gems;
     const accountKey = String(meta.accountKey || meta.uid || '').trim();
 
     if (!accountKey || gemsAmount <= 0) {
-        console.warn('Polar paid event missing accountKey or gems:', { orderId, productId, meta });
-        return res.json({ ok: true, warning: 'Missing accountKey or gems mapping' });
+        console.warn('Polar order.paid missing accountKey:', { orderId: dedupeKey, productId, meta });
+        return res.json({ ok: true, warning: 'Missing accountKey' });
     }
 
-    if (orderId) processedPolarOrders.add(orderId);
-
-    // Queue pending claim so client immediately picks it up on sync/poll
-    const list = pendingPolarGemClaims.get(accountKey) || [];
-    list.push({ orderId, gems: gemsAmount, label: pack ? pack.label : `${gemsAmount} Gems`, ts: Date.now() });
-    pendingPolarGemClaims.set(accountKey, list);
-
-    // Also update Firestore if firebase-admin credentials are configured on Render
-    const dbAdmin = getPolarFirestoreAdmin();
-    if (dbAdmin) {
-        try {
-            const admin = require('firebase-admin');
-            const inc = admin.firestore.FieldValue.increment(gemsAmount);
-            if (accountKey.startsWith('email_') || accountKey.startsWith('uid_')) {
-                await dbAdmin.collection('accounts').doc(accountKey).set({ gems: inc }, { merge: true });
+    inFlightPolarOrders.add(dedupeKey);
+    try {
+        // Persistent deduplication in Firestore so Render restarts or retries never double-grant
+        const dbAdmin = getPolarFirestoreAdmin();
+        if (dbAdmin) {
+            try {
+                const orderRef = dbAdmin.collection('polar_orders').doc(dedupeKey);
+                let alreadyProcessed = false;
+                await dbAdmin.runTransaction(async (tx) => {
+                    const snap = await tx.get(orderRef);
+                    if (snap.exists) {
+                        alreadyProcessed = true;
+                        return;
+                    }
+                    tx.set(orderRef, {
+                        orderId: dedupeKey,
+                        checkoutId: checkoutId || null,
+                        productId,
+                        gems: gemsAmount,
+                        accountKey,
+                        uid: meta.uid ? String(meta.uid) : null,
+                        createdAt: Date.now()
+                    });
+                });
+                if (alreadyProcessed) {
+                    processedPolarOrders.add(dedupeKey);
+                    if (checkoutId) processedPolarOrders.add(checkoutId);
+                    return res.json({ ok: true, duplicate: true, orderId: dedupeKey });
+                }
+            } catch (txErr) {
+                console.warn('Polar Firestore order dedupe warning:', txErr && txErr.message ? txErr.message : txErr);
             }
-            if (meta.uid) {
-                await dbAdmin.collection('users').doc(String(meta.uid)).set({ gems: inc }, { merge: true });
-            }
-        } catch (dbErr) {
-            console.warn('Polar Firestore admin grant warning:', dbErr && dbErr.message ? dbErr.message : dbErr);
         }
-    }
 
-    io.emit('polarGemsGranted', { accountKey, gems: gemsAmount, orderId });
-    return res.json({ ok: true, grantedGems: gemsAmount, accountKey });
+        processedPolarOrders.add(dedupeKey);
+        if (checkoutId) processedPolarOrders.add(checkoutId);
+
+        if (!claimedPolarOrderIds.has(dedupeKey)) {
+            const list = pendingPolarGemClaims.get(accountKey) || [];
+            if (!list.some(item => item.orderId === dedupeKey)) {
+                list.push({
+                    orderId: dedupeKey,
+                    productId,
+                    gems: gemsAmount,
+                    label: pack.label,
+                    ts: Date.now()
+                });
+                pendingPolarGemClaims.set(accountKey, list);
+            }
+        }
+
+        console.log(`Polar order.paid verified: order=${dedupeKey}, pack=${pack.label}, gems=+${gemsAmount}, account=${accountKey}`);
+        return res.json({ ok: true, grantedGems: gemsAmount, orderId: dedupeKey, accountKey });
+    } finally {
+        inFlightPolarOrders.delete(dedupeKey);
+    }
 });
 
 app.get('/api/polar/claim', (req, res) => {
     const accountKey = String((req.query && req.query.accountKey) || '').trim();
     if (!accountKey) return res.json({ ok: true, claims: [] });
-    const claims = pendingPolarGemClaims.get(accountKey) || [];
+    const rawList = pendingPolarGemClaims.get(accountKey) || [];
     pendingPolarGemClaims.delete(accountKey);
-    return res.json({ ok: true, claims });
+
+    const uniqueClaims = [];
+    for (const item of rawList) {
+        if (!item || !item.orderId) continue;
+        if (claimedPolarOrderIds.has(item.orderId)) continue;
+        claimedPolarOrderIds.add(item.orderId);
+        const pack = item.productId ? POLAR_GEM_PACKS[item.productId] : null;
+        const exactGems = pack ? pack.gems : Math.max(0, Math.floor(Number(item.gems) || 0));
+        if (exactGems > 0) {
+            uniqueClaims.push({
+                orderId: item.orderId,
+                productId: item.productId || '',
+                gems: exactGems,
+                label: pack ? pack.label : `${exactGems} Gems`
+            });
+        }
+    }
+
+    return res.json({ ok: true, claims: uniqueClaims });
 });
 
 server.listen(port, () => {
