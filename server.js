@@ -2095,6 +2095,210 @@ function leaveRoom(socket) {
     }
 }
 
+
+// ================= Polar.sh Checkout & Webhook Gem Delivery =================
+const crypto = require('crypto');
+
+const POLAR_GEM_PACKS = {
+    'a270d8d4-e2f4-4aff-afc3-401d1ca4e52a': { gems: 100,   priceUsd: '0.99',  label: '100 Gems Pack' },
+    'cf3ba177-b737-457d-9aab-c4602940f81a': { gems: 550,   priceUsd: '4.99',  label: '550 Gems Pack' },
+    '549c7806-997f-4139-a14b-36469928635c': { gems: 1200,  priceUsd: '9.99',  label: '1200 Gems Pack' },
+    '331ff154-1e9f-4b6c-aa2b-85f91aa881f6': { gems: 2600,  priceUsd: '19.99', label: '2600 Gems Pack' },
+    '1bdfbc13-d26e-4384-a4a6-6720137c45cc': { gems: 6800,  priceUsd: '49.99', label: '6800 Gems Pack' },
+    'e8352f00-80e0-443b-a924-5a68395a83d8': { gems: 14500, priceUsd: '99.99', label: '14500 Gems Pack' }
+};
+
+const processedPolarOrders = new Set();
+const pendingPolarGemClaims = new Map(); // accountKey -> [{ orderId, gems, label, claimedAt }]
+
+let polarAdminDb = null;
+function getPolarFirestoreAdmin() {
+    if (polarAdminDb) return polarAdminDb;
+    try {
+        const admin = require('firebase-admin');
+        if (!admin.apps.length) {
+            if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+                const svc = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+                admin.initializeApp({ credential: admin.credential.cert(svc) });
+            } else {
+                admin.initializeApp({ projectId: 'battlecars-666f9' });
+            }
+        }
+        polarAdminDb = admin.firestore();
+        return polarAdminDb;
+    } catch (e) {
+        return null;
+    }
+}
+
+function getPolarApiBase() {
+    const mode = (process.env.POLAR_ENV || process.env.POLAR_MODE || 'production').trim().toLowerCase();
+    return mode === 'sandbox' ? 'https://sandbox-api.polar.sh' : 'https://api.polar.sh';
+}
+
+app.post('/api/polar/create-checkout', async (req, res) => {
+    const token = (process.env.POLAR_ACCESS_TOKEN || '').trim();
+    if (!token) {
+        return res.status(503).json({
+            ok: false,
+            message: 'Polar payment gateway is not configured on Render yet (missing POLAR_ACCESS_TOKEN).'
+        });
+    }
+
+    const body = req.body || {};
+    const productId = String(body.productId || '').trim();
+    const pack = POLAR_GEM_PACKS[productId];
+    if (!pack) {
+        return res.status(400).json({ ok: false, message: 'Invalid gem pack productId.' });
+    }
+
+    const accountKey = String(body.accountKey || '').trim().slice(0, 128);
+    const uid = String(body.uid || '').trim().slice(0, 128);
+    const successUrl = String(body.successUrl || 'https://battlecars.netlify.app/?polar_status=success').slice(0, 300);
+
+    try {
+        const polarResp = await fetch(`${getPolarApiBase()}/v1/checkouts/`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                products: [productId],
+                success_url: successUrl,
+                metadata: {
+                    accountKey: accountKey || uid || 'guest',
+                    uid: uid || '',
+                    productId,
+                    gems: String(pack.gems)
+                }
+            })
+        });
+
+        const data = await polarResp.json().catch(() => ({}));
+        if (!polarResp.ok || !data || !data.url) {
+            console.error('Polar checkout error:', polarResp.status, data);
+            return res.status(502).json({
+                ok: false,
+                message: (data && (data.detail || data.message)) ? String(data.detail || data.message) : 'Failed to create Polar checkout session.'
+            });
+        }
+
+        return res.json({ ok: true, checkoutUrl: data.url, checkoutId: data.id || '' });
+    } catch (err) {
+        console.error('Polar checkout network error:', err && err.message ? err.message : err);
+        return res.status(500).json({ ok: false, message: 'Network error while creating checkout session.' });
+    }
+});
+
+function verifyPolarWebhookSignature(rawBodyStr, headers) {
+    const secret = (process.env.POLAR_WEBHOOK_SECRET || '').trim();
+    if (!secret) return true; // If not set yet, allow payload parsing while warning in logs
+    if (!rawBodyStr) return false;
+
+    // Standard Webhooks / Svix signature headers or HMAC hex
+    const webhookId = headers['webhook-id'] || headers['svix-id'] || '';
+    const webhookTs = headers['webhook-timestamp'] || headers['svix-timestamp'] || '';
+    const webhookSig = headers['webhook-signature'] || headers['svix-signature'] || headers['x-polar-signature'] || '';
+
+    if (!webhookSig) return false;
+
+    const cleanSecret = secret.startsWith('whsec_') ? Buffer.from(secret.slice(6), 'base64') : secret;
+
+    if (webhookId && webhookTs) {
+        const signedContent = `${webhookId}.${webhookTs}.${rawBodyStr}`;
+        const expectedB64 = crypto.createHmac('sha256', cleanSecret).update(signedContent).digest('base64');
+        const parts = String(webhookSig).split(/[\s,]+/);
+        for (const p of parts) {
+            const val = p.includes(',') ? p.split(',')[1] : p;
+            if (val === expectedB64) return true;
+        }
+    }
+
+    const expectedHex = crypto.createHmac('sha256', cleanSecret).update(rawBodyStr).digest('hex');
+    return String(webhookSig).includes(expectedHex);
+}
+
+app.post('/api/polar/webhook', express.raw({ type: '*/*', limit: '256kb' }), async (req, res) => {
+    const rawStr = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : (typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {}));
+    if (!verifyPolarWebhookSignature(rawStr, req.headers || {})) {
+        return res.status(401).json({ ok: false, message: 'Invalid webhook signature.' });
+    }
+
+    let payload = null;
+    try {
+        payload = JSON.parse(rawStr);
+    } catch (_) {
+        return res.status(400).json({ ok: false, message: 'Invalid JSON payload.' });
+    }
+
+    const eventType = payload && payload.type ? String(payload.type) : '';
+    const dataObj = (payload && payload.data) ? payload.data : {};
+
+    const isPaidEvent = (
+        eventType === 'order.paid' ||
+        eventType === 'checkout.updated' && (dataObj.status === 'succeeded' || dataObj.status === 'confirmed')
+    );
+
+    if (!isPaidEvent) {
+        return res.json({ ok: true, ignored: true, eventType });
+    }
+
+    const orderId = String(dataObj.id || dataObj.order_id || dataObj.checkout_id || '').trim();
+    if (orderId && processedPolarOrders.has(orderId)) {
+        return res.json({ ok: true, duplicate: true, orderId });
+    }
+
+    const meta = (dataObj.metadata && typeof dataObj.metadata === 'object')
+        ? dataObj.metadata
+        : ((dataObj.checkout && dataObj.checkout.metadata) ? dataObj.checkout.metadata : {});
+
+    const productId = String(dataObj.product_id || (dataObj.product && dataObj.product.id) || meta.productId || '').trim();
+    const pack = POLAR_GEM_PACKS[productId];
+    const gemsAmount = pack ? pack.gems : (parseInt(meta.gems || '0', 10) || 0);
+    const accountKey = String(meta.accountKey || meta.uid || '').trim();
+
+    if (!accountKey || gemsAmount <= 0) {
+        console.warn('Polar paid event missing accountKey or gems:', { orderId, productId, meta });
+        return res.json({ ok: true, warning: 'Missing accountKey or gems mapping' });
+    }
+
+    if (orderId) processedPolarOrders.add(orderId);
+
+    // Queue pending claim so client immediately picks it up on sync/poll
+    const list = pendingPolarGemClaims.get(accountKey) || [];
+    list.push({ orderId, gems: gemsAmount, label: pack ? pack.label : `${gemsAmount} Gems`, ts: Date.now() });
+    pendingPolarGemClaims.set(accountKey, list);
+
+    // Also update Firestore if firebase-admin credentials are configured on Render
+    const dbAdmin = getPolarFirestoreAdmin();
+    if (dbAdmin) {
+        try {
+            const admin = require('firebase-admin');
+            const inc = admin.firestore.FieldValue.increment(gemsAmount);
+            if (accountKey.startsWith('email_') || accountKey.startsWith('uid_')) {
+                await dbAdmin.collection('accounts').doc(accountKey).set({ gems: inc }, { merge: true });
+            }
+            if (meta.uid) {
+                await dbAdmin.collection('users').doc(String(meta.uid)).set({ gems: inc }, { merge: true });
+            }
+        } catch (dbErr) {
+            console.warn('Polar Firestore admin grant warning:', dbErr && dbErr.message ? dbErr.message : dbErr);
+        }
+    }
+
+    io.emit('polarGemsGranted', { accountKey, gems: gemsAmount, orderId });
+    return res.json({ ok: true, grantedGems: gemsAmount, accountKey });
+});
+
+app.get('/api/polar/claim', (req, res) => {
+    const accountKey = String((req.query && req.query.accountKey) || '').trim();
+    if (!accountKey) return res.json({ ok: true, claims: [] });
+    const claims = pendingPolarGemClaims.get(accountKey) || [];
+    pendingPolarGemClaims.delete(accountKey);
+    return res.json({ ok: true, claims });
+});
+
 server.listen(port, () => {
     console.log(`Street War Dedicated Server running on port ${port}`);
 });
