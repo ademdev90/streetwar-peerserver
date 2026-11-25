@@ -234,6 +234,95 @@ let serverLeaderboardStore = new Map();
 // ================= Friends & Unique Player ID Directory =================
 const onlinePlayerDirectory = new Map(); // playerId -> { playerId, uid, accountKey, name, country, level, totalXp, hasPass, ownedCars, awakenedCars, careerStats, online, socketId, lastSeen }
 
+// ================= Mutual Friend Requests & Official Friendships =================
+const friendshipsStore = new Map();       // playerId -> Set<friendPlayerId>
+const incomingRequestsStore = new Map();  // targetId -> Map<fromId, { fromId, createdAt, profileSnapshot }>
+const outgoingRequestsStore = new Map();  // fromId   -> Map<targetId, { targetId, createdAt, profileSnapshot }>
+const pendingRemovalStore = new Map();    // targetId -> Set<removedById> (for offline removal sync)
+
+function getOrCreateFriendSet(map, key) {
+    if (!map.has(key)) map.set(key, new Set());
+    return map.get(key);
+}
+
+function getOrCreateFriendMap(map, key) {
+    if (!map.has(key)) map.set(key, new Map());
+    return map.get(key);
+}
+
+function buildSafeProfilePreview(playerId, fallback = null) {
+    const cleanId = String(playerId || '').trim().toUpperCase();
+    const live = onlinePlayerDirectory.get(cleanId);
+    if (live) return toPublicProfileDTO(live);
+    const fb = (fallback && typeof fallback === 'object') ? fallback : {};
+    return {
+        playerId: cleanId,
+        uid: String(fb.uid || ''),
+        name: String(fb.name || 'Driver').trim().slice(0, 18) || 'Driver',
+        country: String(fb.country || 'INTL').trim().slice(0, 10) || 'INTL',
+        level: Math.max(1, Math.floor(Number(fb.level) || 1)),
+        totalXp: Math.max(0, Math.floor(Number(fb.totalXp) || 0)),
+        hasPass: !!fb.hasPass,
+        ownedCars: Array.isArray(fb.ownedCars) && fb.ownedCars.length ? fb.ownedCars : [0],
+        awakenedCars: Array.isArray(fb.awakenedCars) ? fb.awakenedCars : [],
+        careerStats: sanitizeCareerStatsPayload(fb.careerStats),
+        online: false,
+        lastSeen: Number(fb.lastSeen) || Date.now()
+    };
+}
+
+function getFriendSystemSnapshot(playerId) {
+    const cleanId = String(playerId || '').trim().toUpperCase();
+    const friendsIds = Array.from(friendshipsStore.get(cleanId) || []);
+    const incomingMap = incomingRequestsStore.get(cleanId) || new Map();
+    const outgoingMap = outgoingRequestsStore.get(cleanId) || new Map();
+    const removedIds = Array.from(pendingRemovalStore.get(cleanId) || []);
+
+    return {
+        friends: friendsIds.map(id => buildSafeProfilePreview(id)),
+        incoming: Array.from(incomingMap.values()).map(r => ({
+            playerId: r.fromId,
+            createdAt: r.createdAt || Date.now(),
+            profile: buildSafeProfilePreview(r.fromId, r.profileSnapshot)
+        })),
+        outgoing: Array.from(outgoingMap.values()).map(r => ({
+            playerId: r.targetId,
+            createdAt: r.createdAt || Date.now(),
+            profile: buildSafeProfilePreview(r.targetId, r.profileSnapshot)
+        })),
+        removedFriendIds: removedIds
+    };
+}
+
+function emitToPlayerIfOnline(playerId, eventName, payload) {
+    const cleanId = String(playerId || '').trim().toUpperCase();
+    const rec = onlinePlayerDirectory.get(cleanId);
+    if (rec && rec.online && rec.socketId) {
+        io.to(rec.socketId).emit(eventName, payload);
+        return true;
+    }
+    return false;
+}
+
+function makeOfficialFriends(idA, idB) {
+    const a = String(idA || '').trim().toUpperCase();
+    const b = String(idB || '').trim().toUpperCase();
+    if (!a || !b || a === b) return;
+
+    getOrCreateFriendSet(friendshipsStore, a).add(b);
+    getOrCreateFriendSet(friendshipsStore, b).add(a);
+
+    // Clear any pending removal flags between them
+    pendingRemovalStore.get(a)?.delete(b);
+    pendingRemovalStore.get(b)?.delete(a);
+
+    // Clear pending requests in BOTH directions (one acceptance suffices even if both sent requests)
+    incomingRequestsStore.get(a)?.delete(b);
+    outgoingRequestsStore.get(a)?.delete(b);
+    incomingRequestsStore.get(b)?.delete(a);
+    outgoingRequestsStore.get(b)?.delete(a);
+}
+
 function sanitizeCareerModeStats(m) {
     const src = (m && typeof m === 'object') ? m : {};
     return {
@@ -385,10 +474,18 @@ io.on('connection', (socket) => {
     // Friends & Player ID Presence / Lookup (also prepares for Squad Lobby Invites)
     socket.on('registerPlayerProfile', (data = {}, cb) => {
         const rec = syncOnlinePlayerProfile(data, socket.id);
+        let friendState = null;
         if (rec) {
             socket.playerId = rec.playerId;
+            friendState = getFriendSystemSnapshot(rec.playerId);
+            // Clear delivered offline removal notifications once fetched
+            if (pendingRemovalStore.has(rec.playerId)) {
+                pendingRemovalStore.delete(rec.playerId);
+            }
         }
-        if (typeof cb === 'function') cb({ ok: !!rec, profile: toPublicProfileDTO(rec) });
+        if (typeof cb === 'function') {
+            cb({ ok: !!rec, profile: toPublicProfileDTO(rec), friendState });
+        }
     });
 
     socket.on('lookupPlayerById', (data = {}, cb) => {
@@ -413,6 +510,222 @@ io.on('connection', (socket) => {
             if (found) profiles[cleanId] = toPublicProfileDTO(found);
         });
         if (typeof cb === 'function') cb({ ok: true, profiles });
+    });
+
+    // ================= Mutual Friend Requests & Acceptance Socket Handlers =================
+    socket.on('getFriendSystemState', (data = {}, cb) => {
+        const myId = String((data && data.playerId) || socket.playerId || '').trim().toUpperCase();
+        if (!myId) {
+            if (typeof cb === 'function') cb({ ok: false, message: 'Missing Player ID.' });
+            return;
+        }
+        const state = getFriendSystemSnapshot(myId);
+        if (pendingRemovalStore.has(myId)) {
+            pendingRemovalStore.delete(myId);
+        }
+        if (typeof cb === 'function') cb({ ok: true, state });
+    });
+
+    socket.on('sendFriendRequest', (data = {}, cb) => {
+        const fromId = String((data && data.fromId) || socket.playerId || '').trim().toUpperCase();
+        const targetId = String((data && data.targetId) || '').trim().toUpperCase();
+
+        if (!fromId || !targetId) {
+            if (typeof cb === 'function') cb({ ok: false, message: 'Invalid Player ID.' });
+            return;
+        }
+        if (fromId === targetId) {
+            if (typeof cb === 'function') cb({ ok: false, message: 'You cannot send a friend request to yourself.' });
+            return;
+        }
+
+        // Keep sender profile fresh in directory if provided
+        if (data && data.fromProfile && typeof data.fromProfile === 'object') {
+            syncOnlinePlayerProfile(Object.assign({}, data.fromProfile, { playerId: fromId }), socket.id);
+            socket.playerId = fromId;
+        }
+
+        const myFriends = getOrCreateFriendSet(friendshipsStore, fromId);
+        if (myFriends.has(targetId)) {
+            if (typeof cb === 'function') {
+                cb({
+                    ok: true,
+                    status: 'already_friends',
+                    state: getFriendSystemSnapshot(fromId)
+                });
+            }
+            return;
+        }
+
+        // Free Fire Rule: If target ALREADY sent a request to sender -> Instant official friendship!
+        const myIncoming = getOrCreateFriendMap(incomingRequestsStore, fromId);
+        if (myIncoming.has(targetId)) {
+            makeOfficialFriends(fromId, targetId);
+            const fromProf = buildSafeProfilePreview(fromId, data && data.fromProfile);
+            const targetProf = buildSafeProfilePreview(targetId, data && data.targetProfile);
+            emitToPlayerIfOnline(targetId, 'friendRequestAccepted', {
+                friendId: fromId,
+                profile: fromProf,
+                state: getFriendSystemSnapshot(targetId)
+            });
+            if (typeof cb === 'function') {
+                cb({
+                    ok: true,
+                    status: 'accepted_mutual',
+                    profile: targetProf,
+                    state: getFriendSystemSnapshot(fromId)
+                });
+            }
+            return;
+        }
+
+        // Check if already sent
+        const myOutgoing = getOrCreateFriendMap(outgoingRequestsStore, fromId);
+        if (myOutgoing.has(targetId)) {
+            if (typeof cb === 'function') {
+                cb({
+                    ok: true,
+                    status: 'already_pending',
+                    state: getFriendSystemSnapshot(fromId)
+                });
+            }
+            return;
+        }
+
+        const now = Date.now();
+        const fromProf = buildSafeProfilePreview(fromId, data && data.fromProfile);
+        const targetProf = buildSafeProfilePreview(targetId, data && data.targetProfile);
+
+        getOrCreateFriendMap(incomingRequestsStore, targetId).set(fromId, {
+            fromId,
+            createdAt: now,
+            profileSnapshot: fromProf
+        });
+        myOutgoing.set(targetId, {
+            targetId,
+            createdAt: now,
+            profileSnapshot: targetProf
+        });
+
+        emitToPlayerIfOnline(targetId, 'friendRequestReceived', {
+            fromId,
+            profile: fromProf,
+            state: getFriendSystemSnapshot(targetId)
+        });
+
+        if (typeof cb === 'function') {
+            cb({
+                ok: true,
+                status: 'pending',
+                profile: targetProf,
+                state: getFriendSystemSnapshot(fromId)
+            });
+        }
+    });
+
+    socket.on('respondFriendRequest', (data = {}, cb) => {
+        const myId = String((data && data.playerId) || socket.playerId || '').trim().toUpperCase();
+        const fromId = String((data && data.fromId) || '').trim().toUpperCase();
+        const action = String((data && data.action) || '').trim().toLowerCase(); // 'accept' | 'reject'
+
+        if (!myId || !fromId || (action !== 'accept' && action !== 'reject')) {
+            if (typeof cb === 'function') cb({ ok: false, message: 'Invalid response parameters.' });
+            return;
+        }
+
+        if (data && data.myProfile && typeof data.myProfile === 'object') {
+            syncOnlinePlayerProfile(Object.assign({}, data.myProfile, { playerId: myId }), socket.id);
+            socket.playerId = myId;
+        }
+
+        const myIncoming = incomingRequestsStore.get(myId);
+        const existingReq = myIncoming ? myIncoming.get(fromId) : null;
+
+        // If already friends (e.g. mutual race condition), simply succeed cleanly
+        if (action === 'accept' && getOrCreateFriendSet(friendshipsStore, myId).has(fromId)) {
+            incomingRequestsStore.get(myId)?.delete(fromId);
+            outgoingRequestsStore.get(fromId)?.delete(myId);
+            if (typeof cb === 'function') {
+                cb({
+                    ok: true,
+                    action: 'accept',
+                    profile: buildSafeProfilePreview(fromId, existingReq && existingReq.profileSnapshot),
+                    state: getFriendSystemSnapshot(myId)
+                });
+            }
+            return;
+        }
+
+        const myProf = buildSafeProfilePreview(myId, data && data.myProfile);
+        const fromProf = buildSafeProfilePreview(fromId, existingReq && existingReq.profileSnapshot);
+
+        if (action === 'accept') {
+            makeOfficialFriends(myId, fromId);
+            emitToPlayerIfOnline(fromId, 'friendRequestAccepted', {
+                friendId: myId,
+                profile: myProf,
+                state: getFriendSystemSnapshot(fromId)
+            });
+        } else {
+            incomingRequestsStore.get(myId)?.delete(fromId);
+            outgoingRequestsStore.get(fromId)?.delete(myId);
+            emitToPlayerIfOnline(fromId, 'friendRequestRejected', {
+                byId: myId,
+                profile: myProf,
+                state: getFriendSystemSnapshot(fromId)
+            });
+        }
+
+        if (typeof cb === 'function') {
+            cb({
+                ok: true,
+                action,
+                profile: fromProf,
+                state: getFriendSystemSnapshot(myId)
+            });
+        }
+    });
+
+    socket.on('cancelFriendRequest', (data = {}, cb) => {
+        const myId = String((data && data.playerId) || socket.playerId || '').trim().toUpperCase();
+        const targetId = String((data && data.targetId) || '').trim().toUpperCase();
+        if (!myId || !targetId) {
+            if (typeof cb === 'function') cb({ ok: false });
+            return;
+        }
+        outgoingRequestsStore.get(myId)?.delete(targetId);
+        incomingRequestsStore.get(targetId)?.delete(myId);
+
+        emitToPlayerIfOnline(targetId, 'friendSystemUpdated', {
+            state: getFriendSystemSnapshot(targetId)
+        });
+
+        if (typeof cb === 'function') {
+            cb({ ok: true, state: getFriendSystemSnapshot(myId) });
+        }
+    });
+
+    socket.on('removeFriend', (data = {}, cb) => {
+        const myId = String((data && data.playerId) || socket.playerId || '').trim().toUpperCase();
+        const friendId = String((data && data.friendId) || '').trim().toUpperCase();
+        if (!myId || !friendId) {
+            if (typeof cb === 'function') cb({ ok: false });
+            return;
+        }
+        friendshipsStore.get(myId)?.delete(friendId);
+        friendshipsStore.get(friendId)?.delete(myId);
+
+        const delivered = emitToPlayerIfOnline(friendId, 'friendRemovedByOther', {
+            byId: myId,
+            state: getFriendSystemSnapshot(friendId)
+        });
+        if (!delivered) {
+            getOrCreateFriendSet(pendingRemovalStore, friendId).add(myId);
+        }
+
+        if (typeof cb === 'function') {
+            cb({ ok: true, state: getFriendSystemSnapshot(myId) });
+        }
     });
 
     socket.on('getOnlinePlayersCount', (cb) => {
