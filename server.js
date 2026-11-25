@@ -231,6 +231,92 @@ let championshipData = {
 
 let serverLeaderboardStore = new Map();
 
+// ================= Friends & Unique Player ID Directory =================
+const onlinePlayerDirectory = new Map(); // playerId -> { playerId, uid, accountKey, name, country, level, totalXp, hasPass, ownedCars, awakenedCars, careerStats, online, socketId, lastSeen }
+
+function sanitizeCareerModeStats(m) {
+    const src = (m && typeof m === 'object') ? m : {};
+    return {
+        wins: Math.max(0, Math.floor(Number(src.wins) || 0)),
+        kills: Math.max(0, Math.floor(Number(src.kills) || 0)),
+        damage: Math.max(0, Math.floor(Number(src.damage) || 0)),
+        games: Math.max(0, Math.floor(Number(src.games) || 0))
+    };
+}
+
+function sanitizeCareerStatsPayload(cs) {
+    const src = (cs && typeof cs === 'object') ? cs : {};
+    const sanitizeScope = (sc) => {
+        const s = (sc && typeof sc === 'object') ? sc : {};
+        return {
+            br: sanitizeCareerModeStats(s.br),
+            dm: sanitizeCareerModeStats(s.dm),
+            ctf: sanitizeCareerModeStats(s.ctf)
+        };
+    };
+    return {
+        offline: sanitizeScope(src.offline),
+        online: sanitizeScope(src.online)
+    };
+}
+
+function syncOnlinePlayerProfile(payload = {}, socketId = '') {
+    const cleanId = String(payload.playerId || '').trim().toUpperCase().slice(0, 24);
+    if (!cleanId) return null;
+    const prev = onlinePlayerDirectory.get(cleanId) || {};
+    const record = {
+        playerId: cleanId,
+        uid: String(payload.uid || prev.uid || socketId || '').slice(0, 96),
+        accountKey: String(payload.accountKey || prev.accountKey || '').slice(0, 128),
+        name: String(payload.name || prev.name || 'Driver').trim().slice(0, 18) || 'Driver',
+        country: String(payload.country || prev.country || 'INTL').trim().slice(0, 10) || 'INTL',
+        level: Math.max(1, Math.floor(Number(payload.level) || prev.level || 1)),
+        totalXp: Math.max(0, Math.floor(Number(payload.totalXp) || prev.totalXp || 0)),
+        hasPass: payload.hasPass !== undefined ? !!payload.hasPass : !!prev.hasPass,
+        ownedCars: Array.isArray(payload.ownedCars)
+            ? payload.ownedCars.map(Number).filter(n => !isNaN(n)).slice(0, 50)
+            : (Array.isArray(prev.ownedCars) ? prev.ownedCars : [0]),
+        awakenedCars: Array.isArray(payload.awakenedCars)
+            ? payload.awakenedCars.map(Number).filter(n => !isNaN(n)).slice(0, 50)
+            : (Array.isArray(prev.awakenedCars) ? prev.awakenedCars : []),
+        careerStats: payload.careerStats
+            ? sanitizeCareerStatsPayload(payload.careerStats)
+            : (prev.careerStats || sanitizeCareerStatsPayload({})),
+        online: true,
+        socketId: socketId || prev.socketId || '',
+        lastSeen: Date.now()
+    };
+    onlinePlayerDirectory.set(cleanId, record);
+    return record;
+}
+
+function toPublicProfileDTO(rec) {
+    if (!rec) return null;
+    return {
+        playerId: rec.playerId,
+        uid: rec.uid,
+        name: rec.name,
+        country: rec.country,
+        level: rec.level,
+        totalXp: rec.totalXp,
+        hasPass: !!rec.hasPass,
+        ownedCars: rec.ownedCars || [0],
+        awakenedCars: rec.awakenedCars || [],
+        careerStats: rec.careerStats || sanitizeCareerStatsPayload({}),
+        online: !!rec.online,
+        lastSeen: rec.lastSeen || Date.now()
+    };
+}
+
+app.get('/api/player/:playerId', (req, res) => {
+    const qId = String((req.params && req.params.playerId) || '').trim().toUpperCase();
+    if (!qId) return res.status(400).json({ ok: false, message: 'Missing playerId.' });
+    const found = onlinePlayerDirectory.get(qId);
+    if (!found) return res.status(404).json({ ok: false, message: 'Player not found.' });
+    return res.json({ ok: true, profile: toPublicProfileDTO(found) });
+});
+
+
 function recordServerLeaderboardEntry(entry) {
     if (!entry || !entry.uid) return;
     const prev = serverLeaderboardStore.get(entry.uid) || {
@@ -295,6 +381,40 @@ function broadcastOnlinePlayersCount() {
 
 io.on('connection', (socket) => {
     broadcastOnlinePlayersCount();
+
+    // Friends & Player ID Presence / Lookup (also prepares for Squad Lobby Invites)
+    socket.on('registerPlayerProfile', (data = {}, cb) => {
+        const rec = syncOnlinePlayerProfile(data, socket.id);
+        if (rec) {
+            socket.playerId = rec.playerId;
+        }
+        if (typeof cb === 'function') cb({ ok: !!rec, profile: toPublicProfileDTO(rec) });
+    });
+
+    socket.on('lookupPlayerById', (data = {}, cb) => {
+        const queryId = String((data && data.playerId) || '').trim().toUpperCase();
+        if (!queryId) {
+            if (typeof cb === 'function') cb({ ok: false, message: 'Invalid Player ID.' });
+            return;
+        }
+        const found = onlinePlayerDirectory.get(queryId) || null;
+        if (typeof cb === 'function') {
+            cb({ ok: !!found, profile: toPublicProfileDTO(found) });
+        }
+    });
+
+    socket.on('getFriendsPresence', (data = {}, cb) => {
+        const ids = Array.isArray(data && data.playerIds) ? data.playerIds.slice(0, 100) : [];
+        const profiles = {};
+        ids.forEach((rawId) => {
+            const cleanId = String(rawId || '').trim().toUpperCase();
+            if (!cleanId) return;
+            const found = onlinePlayerDirectory.get(cleanId);
+            if (found) profiles[cleanId] = toPublicProfileDTO(found);
+        });
+        if (typeof cb === 'function') cb({ ok: true, profiles });
+    });
+
     socket.on('getOnlinePlayersCount', (cb) => {
         const count = Math.max(1, io.engine ? io.engine.clientsCount : 1);
         if (typeof cb === 'function') cb({ count });
@@ -604,6 +724,20 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
+        if (socket.playerId && onlinePlayerDirectory.has(socket.playerId)) {
+            const rec = onlinePlayerDirectory.get(socket.playerId);
+            if (rec && rec.socketId === socket.id) {
+                rec.online = false;
+                rec.lastSeen = Date.now();
+            }
+        } else {
+            for (const rec of onlinePlayerDirectory.values()) {
+                if (rec && rec.socketId === socket.id) {
+                    rec.online = false;
+                    rec.lastSeen = Date.now();
+                }
+            }
+        }
         setTimeout(broadcastOnlinePlayersCount, 120);
         leaveRoom(socket);
     });
