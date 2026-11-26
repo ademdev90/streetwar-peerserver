@@ -371,6 +371,9 @@ function syncOnlinePlayerProfile(payload = {}, socketId = '') {
         careerStats: payload.careerStats
             ? sanitizeCareerStatsPayload(payload.careerStats)
             : (prev.careerStats || sanitizeCareerStatsPayload({})),
+        car: Number.isInteger(payload.car) ? payload.car : (Number.isInteger(prev.car) ? prev.car : 0),
+        secAbil: Number.isInteger(payload.secAbil) ? payload.secAbil : (Number.isInteger(prev.secAbil) ? prev.secAbil : 1),
+        hasAwakening: payload.hasAwakening !== undefined ? !!payload.hasAwakening : !!prev.hasAwakening,
         online: true,
         socketId: socketId || prev.socketId || '',
         lastSeen: Date.now()
@@ -446,9 +449,200 @@ function buildTournamentBracket(playersList) {
     };
 }
 
-// تحديد الحد الأقصى للاعبين حسب الطور (6 لاعبين أي 3 ضد 3 في طور سرقة العلم CTF، و10 في البقية)
+// ================= Squad / Party System (Max 3 Players) =================
+const partiesStore = new Map();     // partyId -> { id, leaderSocketId, leaderPlayerId, members: [...] }
+const socketToPartyId = new Map();  // socketId -> partyId
+let partySequence = 1;
+
+function serializeParty(party) {
+    if (!party) return null;
+    return {
+        id: party.id,
+        leaderSocketId: party.leaderSocketId,
+        leaderPlayerId: party.leaderPlayerId || '',
+        maxMembers: 3,
+        members: party.members.map(m => ({
+            socketId: m.socketId,
+            playerId: m.playerId || '',
+            name: m.name || 'Driver',
+            car: Number.isInteger(m.car) ? m.car : 0,
+            secAbil: Number.isInteger(m.secAbil) ? m.secAbil : 1,
+            hasPass: !!m.hasPass,
+            hasAwakening: !!m.hasAwakening,
+            level: Math.max(1, Math.floor(Number(m.level) || 1))
+        }))
+    };
+}
+
+function broadcastPartyUpdated(party) {
+    if (!party) return;
+    const payload = serializeParty(party);
+    party.members.forEach(m => {
+        if (m && m.socketId) {
+            io.to(m.socketId).emit('partyUpdated', payload);
+        }
+    });
+}
+
+function buildPartyMemberEntry(sock, data = {}) {
+    const pid = String(sock.playerId || data.senderPlayerId || '').trim().toUpperCase();
+    const dir = pid ? onlinePlayerDirectory.get(pid) : null;
+    return {
+        socketId: sock.id,
+        playerId: pid || (dir ? dir.playerId : ''),
+        name: String(data.name || (dir && dir.name) || 'Driver').trim().slice(0, 18) || 'Driver',
+        car: Number.isInteger(data.car) ? data.car : (dir && Number.isInteger(dir.car) ? dir.car : 0),
+        secAbil: Number.isInteger(data.secAbil) ? data.secAbil : (dir && Number.isInteger(dir.secAbil) ? dir.secAbil : 1),
+        hasPass: data.hasPass !== undefined ? !!data.hasPass : !!(dir && dir.hasPass),
+        hasAwakening: data.hasAwakening !== undefined ? !!data.hasAwakening : !!(dir && dir.hasAwakening),
+        level: Math.max(1, Math.floor(Number(data.level !== undefined ? data.level : (dir && dir.level)) || 1))
+    };
+}
+
+function syncMemberFromDirectory(party, sock, rec) {
+    if (!party || !sock) return false;
+    const member = party.members.find(m => m.socketId === sock.id);
+    if (!member) return false;
+    let changed = false;
+    if (rec) {
+        if (rec.playerId && member.playerId !== rec.playerId) { member.playerId = rec.playerId; changed = true; }
+        if (rec.name && member.name !== rec.name) { member.name = rec.name; changed = true; }
+        if (member.hasPass !== !!rec.hasPass) { member.hasPass = !!rec.hasPass; changed = true; }
+        if (rec.level && member.level !== rec.level) { member.level = rec.level; changed = true; }
+        if (Number.isInteger(rec.car) && member.car !== rec.car) { member.car = rec.car; changed = true; }
+        if (Number.isInteger(rec.secAbil) && member.secAbil !== rec.secAbil) { member.secAbil = rec.secAbil; changed = true; }
+        if (member.hasAwakening !== !!rec.hasAwakening) { member.hasAwakening = !!rec.hasAwakening; changed = true; }
+    }
+    if (party.leaderSocketId === sock.id && member.playerId && party.leaderPlayerId !== member.playerId) {
+        party.leaderPlayerId = member.playerId;
+        changed = true;
+    }
+    return changed;
+}
+
+function removeSocketFromParty(sock, emitClearedToLeaver = true) {
+    if (!sock) return null;
+    const partyId = socketToPartyId.get(sock.id);
+    if (!partyId) return null;
+    socketToPartyId.delete(sock.id);
+
+    const party = partiesStore.get(partyId);
+    if (!party) {
+        if (emitClearedToLeaver) sock.emit('partyUpdated', null);
+        return null;
+    }
+
+    party.members = party.members.filter(m => m.socketId !== sock.id);
+    if (emitClearedToLeaver) {
+        sock.emit('partyUpdated', null);
+    }
+
+    if (party.members.length === 0) {
+        partiesStore.delete(partyId);
+        return null;
+    }
+
+    if (party.leaderSocketId === sock.id) {
+        party.leaderSocketId = party.members[0].socketId;
+        party.leaderPlayerId = party.members[0].playerId || '';
+    }
+    broadcastPartyUpdated(party);
+    return party;
+}
+
+// ================= Mode Normalization & Team Helpers =================
+function normalizeServerMode(mode) {
+    const raw = String(mode || 'br').trim().toUpperCase();
+    if (raw === 'DUO' || raw === 'BR_DUO') return 'BR_DUO';
+    if (raw === '2V2' || raw === 'DM_2V2') return 'DM_2V2';
+    if (raw === 'DM') return 'DM';
+    if (raw === 'CTF') return 'CTF';
+    return 'BR';
+}
+
+function isServerTeamMode(mode) {
+    const m = normalizeServerMode(mode);
+    return m === 'CTF' || m === 'BR_DUO' || m === 'DM_2V2';
+}
+
+function areServerCarsAllied(mode, carA, carB) {
+    if (!carA || !carB) return false;
+    if (carA.uid && carB.uid && carA.uid === carB.uid) return true;
+    if (!isServerTeamMode(mode)) return false;
+    return !!(carA.team && carB.team && carA.team === carB.team);
+}
+
+// تحديد الحد الأقصى للاعبين حسب الطور
 function getMaxPlayersForMode(mode) {
-    return (mode || 'br').toLowerCase() === 'ctf' ? 6 : 10;
+    const m = normalizeServerMode(mode);
+    if (m === 'CTF') return 6;
+    if (m === 'DM_2V2') return 4;
+    return 10;
+}
+
+function getMaxSquadSizeForMode(mode, isPrivate = false) {
+    if (isPrivate) return 3;
+    const m = normalizeServerMode(mode);
+    if (m === 'BR_DUO' || m === 'DM_2V2') return 2;
+    return 3;
+}
+
+function resolveSquadForMatchmaking(socket, data = {}) {
+    const partyId = socketToPartyId.get(socket.id);
+    const party = partyId ? partiesStore.get(partyId) : null;
+    if (party && party.members.length > 1 && party.leaderSocketId !== socket.id) {
+        return { error: 'Only the Squad Leader can start matchmaking!' };
+    }
+
+    const callerName = (data.name || 'Player').toString().substring(0, 14);
+    const callerCar = Number.isInteger(data.car) ? data.car : 0;
+    const callerSecAbil = Number.isInteger(data.secAbil) ? data.secAbil : 1;
+    const callerHasPass = !!data.hasPass;
+    const callerHasAwakening = !!data.hasAwakening;
+
+    if (!party || party.members.length <= 1) {
+        return {
+            party: party || null,
+            squadMembers: [{
+                id: socket.id,
+                name: callerName,
+                car: callerCar,
+                secAbil: callerSecAbil,
+                hasPass: callerHasPass,
+                hasAwakening: callerHasAwakening,
+                partyId: party ? party.id : null,
+                socket: socket
+            }]
+        };
+    }
+
+    const leaderMember = party.members.find(m => m.socketId === socket.id);
+    if (leaderMember) {
+        leaderMember.name = callerName;
+        leaderMember.car = callerCar;
+        leaderMember.secAbil = callerSecAbil;
+        leaderMember.hasPass = callerHasPass;
+        leaderMember.hasAwakening = callerHasAwakening;
+    }
+
+    const squadMembers = [];
+    for (const m of party.members) {
+        const mSock = io.sockets.sockets.get(m.socketId);
+        if (!mSock) continue;
+        const dir = m.playerId ? onlinePlayerDirectory.get(m.playerId) : null;
+        squadMembers.push({
+            id: mSock.id,
+            name: String((mSock.id === socket.id ? callerName : (m.name || (dir && dir.name) || 'Player'))).substring(0, 14),
+            car: Number.isInteger(m.car) ? m.car : (dir && Number.isInteger(dir.car) ? dir.car : 0),
+            secAbil: Number.isInteger(m.secAbil) ? m.secAbil : (dir && Number.isInteger(dir.secAbil) ? dir.secAbil : 1),
+            hasPass: m.hasPass !== undefined ? !!m.hasPass : !!(dir && dir.hasPass),
+            hasAwakening: m.hasAwakening !== undefined ? !!m.hasAwakening : !!(dir && dir.hasAwakening),
+            partyId: party.id,
+            socket: mSock
+        });
+    }
+
+    return { party, squadMembers };
 }
 
 function generatePrivateCode() {
@@ -482,10 +676,201 @@ io.on('connection', (socket) => {
             if (pendingRemovalStore.has(rec.playerId)) {
                 pendingRemovalStore.delete(rec.playerId);
             }
+            const partyId = socketToPartyId.get(socket.id);
+            if (partyId && partiesStore.has(partyId)) {
+                const party = partiesStore.get(partyId);
+                if (syncMemberFromDirectory(party, socket, rec)) {
+                    broadcastPartyUpdated(party);
+                }
+            }
         }
         if (typeof cb === 'function') {
             cb({ ok: !!rec, profile: toPublicProfileDTO(rec), friendState });
         }
+    });
+
+    // ================= Squad / Party Socket.io Handlers =================
+    socket.on('getPartyState', (cb) => {
+        const partyId = socketToPartyId.get(socket.id);
+        const party = partyId ? partiesStore.get(partyId) : null;
+        const payload = serializeParty(party);
+        socket.emit('partyUpdated', payload);
+        if (typeof cb === 'function') cb({ ok: true, party: payload });
+    });
+
+    socket.on('sendPartyInvite', (data = {}, cb) => {
+        const targetPlayerId = String(data.targetPlayerId || data.playerId || '').trim().toUpperCase();
+        if (!targetPlayerId) {
+            const msg = 'Invalid Target Player ID.';
+            socket.emit('partyError', { message: msg });
+            if (typeof cb === 'function') cb({ ok: false, message: msg });
+            return;
+        }
+
+        const targetRec = onlinePlayerDirectory.get(targetPlayerId);
+        const targetSocket = (targetRec && targetRec.online && targetRec.socketId)
+            ? io.sockets.sockets.get(targetRec.socketId)
+            : null;
+        if (!targetRec || !targetRec.online || !targetSocket) {
+            const msg = 'Player is offline or unreachable.';
+            socket.emit('partyError', { message: msg });
+            if (typeof cb === 'function') cb({ ok: false, message: msg });
+            return;
+        }
+
+        if (targetSocket.id === socket.id || (socket.playerId && targetPlayerId === socket.playerId)) {
+            const msg = 'You cannot invite yourself to a squad.';
+            socket.emit('partyError', { message: msg });
+            if (typeof cb === 'function') cb({ ok: false, message: msg });
+            return;
+        }
+
+        let partyId = socketToPartyId.get(socket.id);
+        let party = partyId ? partiesStore.get(partyId) : null;
+
+        if (party) {
+            if (party.leaderSocketId !== socket.id) {
+                const msg = 'Only the Squad Leader can send invites!';
+                socket.emit('partyError', { message: msg });
+                if (typeof cb === 'function') cb({ ok: false, message: msg });
+                return;
+            }
+            if (party.members.length >= 3) {
+                const msg = 'Your squad is already full (3/3)!';
+                socket.emit('partyError', { message: msg });
+                if (typeof cb === 'function') cb({ ok: false, message: msg });
+                return;
+            }
+            const alreadyInParty = party.members.some(m =>
+                m.socketId === targetSocket.id || (m.playerId && m.playerId === targetPlayerId)
+            );
+            if (alreadyInParty) {
+                const msg = `${targetRec.name || targetPlayerId} is already in your squad!`;
+                socket.emit('partyError', { message: msg });
+                if (typeof cb === 'function') cb({ ok: false, message: msg });
+                return;
+            }
+            const callerMember = buildPartyMemberEntry(socket, data);
+            const idx = party.members.findIndex(m => m.socketId === socket.id);
+            if (idx >= 0) party.members[idx] = callerMember;
+        } else {
+            const leaderMember = buildPartyMemberEntry(socket, data);
+            partyId = `party_${partySequence++}_${Date.now()}`;
+            party = {
+                id: partyId,
+                leaderSocketId: socket.id,
+                leaderPlayerId: leaderMember.playerId || socket.playerId || '',
+                members: [leaderMember]
+            };
+            partiesStore.set(partyId, party);
+            socketToPartyId.set(socket.id, partyId);
+        }
+
+        broadcastPartyUpdated(party);
+
+        const leaderInfo = party.members.find(m => m.socketId === socket.id) || buildPartyMemberEntry(socket, data);
+        targetSocket.emit('partyInviteReceived', {
+            partyId: party.id,
+            fromSocketId: socket.id,
+            fromPlayerId: leaderInfo.playerId || socket.playerId || '',
+            fromName: leaderInfo.name || 'Driver',
+            fromHasPass: !!leaderInfo.hasPass,
+            fromLevel: leaderInfo.level || 1,
+            party: serializeParty(party)
+        });
+
+        if (typeof cb === 'function') cb({ ok: true, party: serializeParty(party) });
+    });
+
+    socket.on('respondPartyInvite', (data = {}, cb) => {
+        const partyId = String(data.partyId || '').trim();
+        const accept = !!data.accept;
+        const party = partyId ? partiesStore.get(partyId) : null;
+        const myDir = socket.playerId ? onlinePlayerDirectory.get(socket.playerId) : null;
+        const myName = String(data.name || (myDir && myDir.name) || 'Player').trim().slice(0, 18) || 'Player';
+
+        if (!party) {
+            if (accept) {
+                socket.emit('partyError', { message: 'Squad invite expired or squad no longer exists.' });
+            }
+            if (typeof cb === 'function') cb({ ok: false, message: 'Squad not found.' });
+            return;
+        }
+
+        if (!accept) {
+            io.to(party.leaderSocketId).emit('partyInviteDeclined', {
+                partyId: party.id,
+                bySocketId: socket.id,
+                byPlayerId: socket.playerId || '',
+                byName: myName
+            });
+            if (typeof cb === 'function') cb({ ok: true, declined: true });
+            return;
+        }
+
+        const alreadyMember = party.members.some(m => m.socketId === socket.id);
+        if (alreadyMember) {
+            broadcastPartyUpdated(party);
+            if (typeof cb === 'function') cb({ ok: true, party: serializeParty(party) });
+            return;
+        }
+
+        if (party.members.length >= 3) {
+            const msg = 'That squad is already full (3/3)!';
+            socket.emit('partyError', { message: msg });
+            if (typeof cb === 'function') cb({ ok: false, message: msg });
+            return;
+        }
+
+        removeSocketFromParty(socket, false);
+
+        const newMember = buildPartyMemberEntry(socket, data);
+        party.members.push(newMember);
+        socketToPartyId.set(socket.id, party.id);
+        broadcastPartyUpdated(party);
+
+        if (typeof cb === 'function') cb({ ok: true, party: serializeParty(party) });
+    });
+
+    socket.on('leaveParty', (cb) => {
+        removeSocketFromParty(socket, true);
+        if (typeof cb === 'function') cb({ ok: true });
+    });
+
+    socket.on('kickPartyMember', (data = {}, cb) => {
+        const partyId = socketToPartyId.get(socket.id);
+        const party = partyId ? partiesStore.get(partyId) : null;
+        if (!party || party.leaderSocketId !== socket.id) {
+            const msg = 'Only the Squad Leader can kick members!';
+            socket.emit('partyError', { message: msg });
+            if (typeof cb === 'function') cb({ ok: false, message: msg });
+            return;
+        }
+
+        const targetSocketId = data.socketId ? String(data.socketId).trim() : '';
+        const targetPlayerId = data.playerId ? String(data.playerId).trim().toUpperCase() : '';
+        const targetMember = party.members.find(m =>
+            (targetSocketId && m.socketId === targetSocketId) ||
+            (targetPlayerId && m.playerId === targetPlayerId)
+        );
+
+        if (!targetMember || targetMember.socketId === socket.id) {
+            if (typeof cb === 'function') cb({ ok: false, message: 'Member not found.' });
+            return;
+        }
+
+        party.members = party.members.filter(m => m.socketId !== targetMember.socketId);
+        socketToPartyId.delete(targetMember.socketId);
+
+        const leaderMember = party.members.find(m => m.socketId === socket.id);
+        io.to(targetMember.socketId).emit('partyKicked', {
+            partyId: party.id,
+            byName: leaderMember ? leaderMember.name : 'Squad Leader'
+        });
+        io.to(targetMember.socketId).emit('partyUpdated', null);
+
+        broadcastPartyUpdated(party);
+        if (typeof cb === 'function') cb({ ok: true, party: serializeParty(party) });
     });
 
     socket.on('lookupPlayerById', (data = {}, cb) => {
@@ -829,19 +1214,30 @@ io.on('connection', (socket) => {
 
     // البحث العشوائي السريع (Quick Matchmaking)
     socket.on('findMatch', (data = {}) => {
-        leaveRoom(socket);
+        const squadRes = resolveSquadForMatchmaking(socket, data);
+        if (squadRes.error) {
+            socket.emit('partyError', { message: squadRes.error });
+            return;
+        }
 
-        const mode = (data.mode || 'br').toLowerCase();
-        const maxPlayers = getMaxPlayersForMode(mode);
-        const playerName = (data.name || 'Player').toString().substring(0, 14);
-        const playerCar = Number.isInteger(data.car) ? data.car : 0;
-        const playerSecAbil = Number.isInteger(data.secAbil) ? data.secAbil : 1;
-        const playerHasPass = !!data.hasPass;
-        const playerHasAwakening = !!data.hasAwakening;
+        const normMode = normalizeServerMode(data.mode || 'br');
+        const mode = normMode.toLowerCase();
+        const maxPlayers = getMaxPlayersForMode(normMode);
+        const maxSquadSize = getMaxSquadSizeForMode(normMode, false);
+        const squadMembers = squadRes.squadMembers;
+
+        if (squadMembers.length > maxSquadSize) {
+            socket.emit('partyError', {
+                message: `${normMode} allows at most ${maxSquadSize} players per squad (your squad has ${squadMembers.length}).`
+            });
+            return;
+        }
+
+        squadMembers.forEach(m => leaveRoom(m.socket));
 
         let targetRoomId = Object.keys(rooms).find(id => {
             const r = rooms[id];
-            return r && r.mode === mode && !r.started && !r.isPrivate && r.players.length < maxPlayers;
+            return r && normalizeServerMode(r.mode) === normMode && !r.started && !r.isPrivate && (r.players.length + squadMembers.length) <= maxPlayers;
         });
 
         if (!targetRoomId) {
@@ -850,17 +1246,26 @@ io.on('connection', (socket) => {
         }
 
         const room = rooms[targetRoomId];
-        socket.join(targetRoomId);
-        socket.currentRoomId = targetRoomId;
-
-        room.players.push({
-            id: socket.id,
-            name: playerName,
-            car: playerCar,
-            secAbil: playerSecAbil,
-            hasPass: playerHasPass,
-            hasAwakening: playerHasAwakening,
-            socket: socket
+        squadMembers.forEach(m => {
+            m.socket.join(targetRoomId);
+            m.socket.currentRoomId = targetRoomId;
+            room.players.push({
+                id: m.id,
+                name: m.name,
+                car: m.car,
+                secAbil: m.secAbil,
+                hasPass: m.hasPass,
+                hasAwakening: m.hasAwakening,
+                partyId: m.partyId,
+                socket: m.socket
+            });
+            if (m.socket.id !== socket.id) {
+                m.socket.emit('partyMatchmakingStarted', {
+                    mode: mode,
+                    roomId: targetRoomId,
+                    isPrivate: false
+                });
+            }
         });
 
         broadcastLobbyState(targetRoomId);
@@ -894,16 +1299,25 @@ io.on('connection', (socket) => {
 
     // إنشاء روم خاص (Custom Private Room)
     socket.on('createPrivateRoom', (data = {}) => {
-        leaveRoom(socket);
+        const squadRes = resolveSquadForMatchmaking(socket, data);
+        if (squadRes.error) {
+            socket.emit('partyError', { message: squadRes.error });
+            return;
+        }
 
-        const mode = (data.mode || 'br').toLowerCase();
+        const normMode = normalizeServerMode(data.mode || 'br');
+        const mode = normMode.toLowerCase();
+        const maxPlayers = getMaxPlayersForMode(normMode);
+        const squadMembers = squadRes.squadMembers;
+
+        if (squadMembers.length > 3 || squadMembers.length > maxPlayers) {
+            socket.emit('partyError', { message: `Squad size (${squadMembers.length}) exceeds room capacity (${maxPlayers}).` });
+            return;
+        }
+
+        squadMembers.forEach(m => leaveRoom(m.socket));
+
         const allowBots = data.allowBots !== false;
-        const playerName = (data.name || 'Player').toString().substring(0, 14);
-        const playerCar = Number.isInteger(data.car) ? data.car : 0;
-        const playerSecAbil = Number.isInteger(data.secAbil) ? data.secAbil : 1;
-        const playerHasPass = !!data.hasPass;
-        const playerHasAwakening = !!data.hasAwakening;
-
         const code = generatePrivateCode();
         const roomId = `priv_${code}_${Date.now()}`;
         const room = createNewRoomObject(roomId, mode, true);
@@ -912,20 +1326,36 @@ io.on('connection', (socket) => {
         room.allowBots = allowBots;
         rooms[roomId] = room;
 
-        socket.join(roomId);
-        socket.currentRoomId = roomId;
-
-        room.players.push({
-            id: socket.id,
-            name: playerName,
-            car: playerCar,
-            secAbil: playerSecAbil,
-            hasPass: playerHasPass,
-            hasAwakening: playerHasAwakening,
-            socket: socket
+        squadMembers.forEach(m => {
+            m.socket.join(roomId);
+            m.socket.currentRoomId = roomId;
+            room.players.push({
+                id: m.id,
+                name: m.name,
+                car: m.car,
+                secAbil: m.secAbil,
+                hasPass: m.hasPass,
+                hasAwakening: m.hasAwakening,
+                partyId: m.partyId,
+                socket: m.socket
+            });
+            if (m.socket.id !== socket.id) {
+                m.socket.emit('partyMatchmakingStarted', {
+                    mode: mode,
+                    roomId: roomId,
+                    code: code,
+                    isPrivate: true
+                });
+            }
         });
 
-        socket.emit('privateRoomCreated', buildPrivateRoomPayload(room));
+        const payload = buildPrivateRoomPayload(room);
+        socket.emit('privateRoomCreated', payload);
+        squadMembers.forEach(m => {
+            if (m.socket.id !== socket.id) {
+                m.socket.emit('privateRoomUpdate', payload);
+            }
+        });
     });
 
     // الانضمام إلى روم خاص عبر الكود أو الرابط
@@ -952,31 +1382,44 @@ io.on('connection', (socket) => {
             return;
         }
 
+        const squadRes = resolveSquadForMatchmaking(socket, data);
+        if (squadRes.error) {
+            socket.emit('partyError', { message: squadRes.error });
+            return;
+        }
+        const squadMembers = squadRes.squadMembers;
+
         const maxPlayers = getMaxPlayersForMode(room.mode);
-        if (room.players.length >= maxPlayers) {
-            socket.emit('privateRoomError', { message: `Room is full (${maxPlayers}/${maxPlayers})!` });
+        if (room.players.length + squadMembers.length > maxPlayers) {
+            const msg = `Room does not have enough slots for your squad (${room.players.length}/${maxPlayers})!`;
+            socket.emit('privateRoomError', { message: msg });
+            if (squadMembers.length > 1) socket.emit('partyError', { message: msg });
             return;
         }
 
-        leaveRoom(socket);
+        squadMembers.forEach(m => leaveRoom(m.socket));
 
-        const playerName = (data.name || 'Player').toString().substring(0, 14);
-        const playerCar = Number.isInteger(data.car) ? data.car : 0;
-        const playerSecAbil = Number.isInteger(data.secAbil) ? data.secAbil : 1;
-        const playerHasPass = !!data.hasPass;
-        const playerHasAwakening = !!data.hasAwakening;
-
-        socket.join(targetRoomId);
-        socket.currentRoomId = targetRoomId;
-
-        room.players.push({
-            id: socket.id,
-            name: playerName,
-            car: playerCar,
-            secAbil: playerSecAbil,
-            hasPass: playerHasPass,
-            hasAwakening: playerHasAwakening,
-            socket: socket
+        squadMembers.forEach(m => {
+            m.socket.join(targetRoomId);
+            m.socket.currentRoomId = targetRoomId;
+            room.players.push({
+                id: m.id,
+                name: m.name,
+                car: m.car,
+                secAbil: m.secAbil,
+                hasPass: m.hasPass,
+                hasAwakening: m.hasAwakening,
+                partyId: m.partyId,
+                socket: m.socket
+            });
+            if (m.socket.id !== socket.id) {
+                m.socket.emit('partyMatchmakingStarted', {
+                    mode: room.mode,
+                    roomId: targetRoomId,
+                    code: room.code,
+                    isPrivate: true
+                });
+            }
         });
 
         broadcastPrivateRoomState(targetRoomId);
@@ -989,9 +1432,9 @@ io.on('connection', (socket) => {
         if (!room || !room.isPrivate || room.started || room.hostId !== socket.id) return;
 
         if (data.mode) {
-            const nextMode = data.mode.toString().toLowerCase();
-            if (['br', 'dm', 'ctf'].includes(nextMode)) {
-                room.mode = nextMode;
+            const normNext = normalizeServerMode(data.mode);
+            if (['BR', 'BR_DUO', 'DM', 'DM_2V2', 'CTF'].includes(normNext)) {
+                room.mode = normNext.toLowerCase();
             }
         }
         if (typeof data.allowBots === 'boolean') {
@@ -1051,6 +1494,7 @@ io.on('connection', (socket) => {
                 }
             }
         }
+        removeSocketFromParty(socket, false);
         setTimeout(broadcastOnlinePlayersCount, 120);
         leaveRoom(socket);
     });
@@ -1133,7 +1577,8 @@ function startGame(roomId) {
         car: p.car,
         secAbil: p.secAbil || 1,
         hasPass: !!p.hasPass,
-        hasAwakening: !!p.hasAwakening
+        hasAwakening: !!p.hasAwakening,
+        partyId: p.partyId || null
     }));
 
     // إذا كان الروم خاصاً وتم إيقاف البوتات من قِبل صاحب الروم، يكون عدد البوتات 0
@@ -1171,7 +1616,7 @@ function startGame(roomId) {
 }
 
 function initServerWorld(room, realPlayers, botsCount) {
-    const mode = room.mode.toUpperCase();
+    const mode = normalizeServerMode(room.mode);
     const mapIndex = Math.floor(Math.random() * 5);
 
     const obstacles = [];
@@ -1182,6 +1627,14 @@ function initServerWorld(room, realPlayers, botsCount) {
             r: Math.round(30 + Math.random() * 50)
         });
     }
+
+    const clearObstaclesNear = (x, y, pad = 75) => {
+        for (let oi = obstacles.length - 1; oi >= 0; oi--) {
+            if (Math.hypot(obstacles[oi].x - x, obstacles[oi].y - y) < obstacles[oi].r + pad) {
+                obstacles.splice(oi, 1);
+            }
+        }
+    };
 
     // نقاط انطلاق محددة ومنظمة للباتل رويال حول الخريطة
     const BR_SPAWN_SLOTS = [
@@ -1200,6 +1653,15 @@ function initServerWorld(room, realPlayers, botsCount) {
         const j = Math.floor(Math.random() * (i + 1));
         [BR_SPAWN_SLOTS[i], BR_SPAWN_SLOTS[j]] = [BR_SPAWN_SLOTS[j], BR_SPAWN_SLOTS[i]];
     }
+
+    const DUO_TEAMS = ['team_1', 'team_2', 'team_3', 'team_4', 'team_5'];
+    const duoAnchors = {};
+    const duoTeamSlotUsed = {};
+    DUO_TEAMS.forEach((tName, idx) => {
+        duoAnchors[tName] = BR_SPAWN_SLOTS[idx % BR_SPAWN_SLOTS.length];
+        duoTeamSlotUsed[tName] = 0;
+    });
+
     let brSlotCursor = 0;
     const getSpawnPosition = (team) => {
         if (mode === 'CTF') {
@@ -1208,14 +1670,29 @@ function initServerWorld(room, realPlayers, botsCount) {
                 y: MAP_SIZE / 2 - 200 + Math.random() * 400
             };
         }
+        if (mode === 'DM_2V2') {
+            const pos = {
+                x: team === 'red' ? 320 + Math.random() * 200 : MAP_SIZE - 520 + Math.random() * 200,
+                y: MAP_SIZE / 2 - 220 + Math.random() * 440
+            };
+            clearObstaclesNear(pos.x, pos.y, 65);
+            return pos;
+        }
+        if (mode === 'BR_DUO' && team && duoAnchors[team]) {
+            const anchor = duoAnchors[team];
+            const memberIdx = duoTeamSlotUsed[team] || 0;
+            duoTeamSlotUsed[team] = memberIdx + 1;
+            const offsets = [{ dx: 0, dy: 0 }, { dx: 74, dy: 26 }, { dx: -74, dy: 26 }];
+            const off = offsets[memberIdx % offsets.length];
+            const px = Math.max(80, Math.min(MAP_SIZE - 80, anchor.x + off.dx));
+            const py = Math.max(80, Math.min(MAP_SIZE - 80, anchor.y + off.dy));
+            clearObstaclesNear(px, py, 75);
+            return { x: px, y: py };
+        }
         if (mode === 'BR') {
             const slot = BR_SPAWN_SLOTS[brSlotCursor % BR_SPAWN_SLOTS.length];
             brSlotCursor++;
-            for (let oi = obstacles.length - 1; oi >= 0; oi--) {
-                if (Math.hypot(obstacles[oi].x - slot.x, obstacles[oi].y - slot.y) < obstacles[oi].r + 75) {
-                    obstacles.splice(oi, 1);
-                }
-            }
+            clearObstaclesNear(slot.x, slot.y, 75);
             return { x: slot.x, y: slot.y };
         }
         return {
@@ -1224,9 +1701,62 @@ function initServerWorld(room, realPlayers, botsCount) {
         };
     };
 
+    // Group real players by partyId so squadmates share the same team
+    const partyGroups = [];
+    const partyMap = new Map();
+    realPlayers.forEach(pData => {
+        if (pData.partyId) {
+            if (!partyMap.has(pData.partyId)) {
+                const grp = [];
+                partyMap.set(pData.partyId, grp);
+                partyGroups.push(grp);
+            }
+            partyMap.get(pData.partyId).push(pData);
+        } else {
+            partyGroups.push([pData]);
+        }
+    });
+
+    const assignedTeamById = new Map();
+    if (mode === 'BR_DUO') {
+        const teamCounts = Object.fromEntries(DUO_TEAMS.map(t => [t, 0]));
+        const multiGroups = partyGroups.filter(g => g.length > 1);
+        const soloGroups = partyGroups.filter(g => g.length === 1);
+        [...multiGroups, ...soloGroups].forEach(grp => {
+            let chosenTeam = DUO_TEAMS.find(t => teamCounts[t] === 0 && grp.length <= 2)
+                || DUO_TEAMS.find(t => teamCounts[t] + grp.length <= 2)
+                || DUO_TEAMS.slice().sort((a, b) => teamCounts[a] - teamCounts[b])[0];
+            teamCounts[chosenTeam] += grp.length;
+            grp.forEach(p => assignedTeamById.set(p.id, chosenTeam));
+        });
+    } else if (mode === 'CTF' || mode === 'DM_2V2') {
+        const teamCap = mode === 'DM_2V2' ? 2 : 3;
+        let redCount = 0;
+        let blueCount = 0;
+        const multiGroups = partyGroups.filter(g => g.length > 1);
+        const soloGroups = partyGroups.filter(g => g.length === 1);
+        [...multiGroups, ...soloGroups].forEach(grp => {
+            let chosen = 'red';
+            const redFits = (redCount + grp.length) <= teamCap;
+            const blueFits = (blueCount + grp.length) <= teamCap;
+            if (redFits && blueFits) {
+                chosen = redCount <= blueCount ? 'red' : 'blue';
+            } else if (redFits) {
+                chosen = 'red';
+            } else if (blueFits) {
+                chosen = 'blue';
+            } else {
+                chosen = redCount <= blueCount ? 'red' : 'blue';
+            }
+            if (chosen === 'red') redCount += grp.length;
+            else blueCount += grp.length;
+            grp.forEach(p => assignedTeamById.set(p.id, chosen));
+        });
+    }
+
     const cars = [];
-    realPlayers.forEach((pData, idx) => {
-        const team = mode === 'CTF' ? (idx % 2 === 0 ? 'red' : 'blue') : null;
+    realPlayers.forEach(pData => {
+        const team = assignedTeamById.has(pData.id) ? assignedTeamById.get(pData.id) : null;
         const pos = getSpawnPosition(team);
         const carObj = createServerCar(pData.id, pData.name, pos.x, pos.y, false, pData.car, pData.secAbil, team, !!pData.hasPass, !!pData.hasAwakening);
         carObj.angle = Math.atan2(MAP_SIZE / 2 - pos.y, MAP_SIZE / 2 - pos.x);
@@ -1235,9 +1765,15 @@ function initServerWorld(room, realPlayers, botsCount) {
 
     for (let i = 0; i < botsCount; i++) {
         const bType = Math.floor(Math.random() * 18);
-        const redCount = cars.filter(c => c.team === 'red').length;
-        const blueCount = cars.filter(c => c.team === 'blue').length;
-        const team = mode === 'CTF' ? (redCount <= blueCount ? 'red' : 'blue') : null;
+        let team = null;
+        if (mode === 'BR_DUO') {
+            team = DUO_TEAMS.find(t => cars.filter(c => c.team === t).length < 2)
+                || DUO_TEAMS.slice().sort((a, b) => cars.filter(c => c.team === a).length - cars.filter(c => c.team === b).length)[0];
+        } else if (mode === 'CTF' || mode === 'DM_2V2') {
+            const redCount = cars.filter(c => c.team === 'red').length;
+            const blueCount = cars.filter(c => c.team === 'blue').length;
+            team = redCount <= blueCount ? 'red' : 'blue';
+        }
         const pos = getSpawnPosition(team);
         const bName = BOT_NAMES[i] || `Bot_${i + 1}`;
         const botSec = Math.floor(Math.random() * 7) + 1;
@@ -1246,10 +1782,13 @@ function initServerWorld(room, realPlayers, botsCount) {
         cars.push(botObj);
     }
 
+    const initialTeamCount = new Set(cars.filter(c => c.team).map(c => c.team)).size;
+
     room.state = {
         map: mapIndex,
         mode: mode,
         initialCarsCount: cars.length,
+        initialTeamCount: initialTeamCount,
         introTimer: 132,
         timer: 0,
         dmTimer: 180 * 60,
@@ -1391,7 +1930,7 @@ function simulateRoomStep(room) {
     }
 
     st.timer++;
-    if (st.mode === 'BR') {
+    if (st.mode === 'BR' || st.mode === 'BR_DUO') {
         if (st.zone.radius > 150) st.zone.radius -= 0.2;
     } else {
         st.dmTimer--;
@@ -1412,7 +1951,7 @@ function simulateRoomStep(room) {
         const ownerCar = st.cars.find(c => c.uid === m.ownerUid);
         st.cars.forEach(c => {
             if (c.alive && !c.isReviving && c.uid !== m.ownerUid && Math.hypot(c.x - m.x, c.y - m.y) < 250) {
-                if (st.mode === 'CTF' && ownerCar && c.team === ownerCar.team) return;
+                if (areServerCarsAllied(st.mode, ownerCar, c)) return;
                 const ang = Math.atan2(m.y - c.y, m.x - c.x);
                 c.x += Math.cos(ang) * 3;
                 c.y += Math.sin(ang) * 3;
@@ -1421,7 +1960,7 @@ function simulateRoomStep(room) {
         if (m.timer <= 0) {
             st.cars.forEach(c => {
                 if (c.alive && !c.isReviving && Math.hypot(c.x - m.x, c.y - m.y) < 150) {
-                    if (st.mode === 'CTF' && ownerCar && c.team === ownerCar.team) return;
+                    if (areServerCarsAllied(st.mode, ownerCar, c)) return;
                     damageServerCar(room, c, 40, ownerCar);
                 }
             });
@@ -1435,7 +1974,7 @@ function simulateRoomStep(room) {
         const ownerCar = st.cars.find(c => c.uid === l.ownerUid);
         st.cars.forEach(c => {
             if (c.alive && !c.isReviving && c.uid !== l.ownerUid && Math.hypot(c.x - l.x, c.y - l.y) < 120) {
-                if (st.mode === 'CTF' && ownerCar && c.team === ownerCar.team) return;
+                if (areServerCarsAllied(st.mode, ownerCar, c)) return;
                 c.slowTimer = 12;
                 c.speed *= 0.42;
                 damageServerCar(room, c, 0.5, ownerCar);
@@ -1451,7 +1990,7 @@ function simulateRoomStep(room) {
         const ownerCar = st.cars.find(c => c.uid === fg.ownerUid);
         st.cars.forEach(c => {
             if (c.alive && !c.isReviving && c.uid !== fg.ownerUid && Math.hypot(c.x - fg.x, c.y - fg.y) < 145) {
-                if (st.mode === 'CTF' && ownerCar && c.team === ownerCar.team) return;
+                if (areServerCarsAllied(st.mode, ownerCar, c)) return;
                 c.blindTimer = 300;
             }
         });
@@ -1468,7 +2007,7 @@ function simulateRoomStep(room) {
             let target = null, minDist = 650;
             st.cars.forEach(c => {
                 if (c.alive && !c.isReviving && c.uid !== t.ownerUid) {
-                    if (st.mode === 'CTF' && ownerCar && c.team === ownerCar.team) return;
+                    if (ownerCar ? areServerCarsAllied(st.mode, ownerCar, c) : (isServerTeamMode(st.mode) && t.team && c.team === t.team)) return;
                     const d = Math.hypot(c.x - t.x, c.y - t.y);
                     if (d < minDist) { minDist = d; target = c; }
                 }
@@ -1511,7 +2050,7 @@ function simulateRoomStep(room) {
         const ownerCar = st.cars.find(c => c.uid === db.ownerUid);
         st.cars.forEach(c => {
             if (c.alive && !c.isReviving && c.uid !== db.ownerUid && Math.hypot(c.x - db.x, c.y - db.y) < (db.r || 12) + 20) {
-                if (st.mode === 'CTF' && ownerCar && c.team === ownerCar.team) return;
+                if (areServerCarsAllied(st.mode, ownerCar, c)) return;
                 if (!db.hitCooldowns) db.hitCooldowns = {};
                 if ((db.hitCooldowns[c.uid] || 0) <= 0) {
                     db.hitCooldowns[c.uid] = 35;
@@ -1619,7 +2158,7 @@ function simulateRoomStep(room) {
             let closest = null, minDist = Infinity;
             st.cars.forEach(c => {
                 if (c.uid !== b.ownerUid && c.alive && !c.isReviving) {
-                    if (st.mode === 'CTF' && ownerCar && c.team === ownerCar.team) return;
+                    if (areServerCarsAllied(st.mode, ownerCar, c)) return;
                     const d = Math.hypot(c.x - b.x, c.y - b.y);
                     if (d < minDist) { minDist = d; closest = c; }
                 }
@@ -1657,7 +2196,7 @@ function simulateRoomStep(room) {
         for (const w of st.walls) {
             if (b.ownerUid !== w.ownerUid) {
                 const wallOwner = st.cars.find(c => c.uid === w.ownerUid);
-                if (!wallOwner || !ownerCar || st.mode !== 'CTF' || ownerCar.team !== wallOwner.team) {
+                if (!wallOwner || !ownerCar || !areServerCarsAllied(st.mode, ownerCar, wallOwner)) {
                     const half = (w.length || 115) / 2;
                     const x1 = w.x - Math.cos(w.angle) * half;
                     const y1 = w.y - Math.sin(w.angle) * half;
@@ -1703,7 +2242,7 @@ function simulateRoomStep(room) {
                 c.alive && !c.isReviving &&
                 c.uid !== ignoreUid && c.uid !== b.ownerUid &&
                 Math.hypot(c.x - b.x, c.y - b.y) < hitRadius &&
-                (st.mode !== 'CTF' || !ownerCar || c.team !== ownerCar.team)
+                !areServerCarsAllied(st.mode, ownerCar, c)
             );
             if (target) {
                 const distRatio = Math.min(1, (b.distanceTraveled || 0) / 1100);
@@ -1761,6 +2300,28 @@ function simulateRoomStep(room) {
         if (st.dmTimer <= 0) {
             finishServerMatch(room);
         }
+    } else if (st.mode === 'DM_2V2') {
+        if (st.dmTimer <= 0 || st.redScore >= 15 || st.blueScore >= 15) {
+            const winningTeam = st.redScore >= st.blueScore ? 'red' : 'blue';
+            st.cars.forEach(c => {
+                c.rank = (c.team === winningTeam) ? 1 : 2;
+            });
+            finishServerMatch(room);
+        }
+    } else if (st.mode === 'BR_DUO') {
+        const aliveTeams = new Set(st.cars.filter(c => c.alive && c.team).map(c => c.team));
+        const aliveHumans = st.cars.filter(c => !c.isAI && c.alive);
+        const initialTeams = st.initialTeamCount || new Set(st.cars.filter(c => c.team).map(c => c.team)).size;
+        const minAliveTeamsToEnd = (initialTeams <= 1) ? 0 : 1;
+        if (aliveTeams.size <= minAliveTeamsToEnd || aliveHumans.length === 0) {
+            if (aliveTeams.size === 1) {
+                const winTeam = Array.from(aliveTeams)[0];
+                st.cars.forEach(c => {
+                    if (c.team === winTeam) c.rank = 1;
+                });
+            }
+            finishServerMatch(room);
+        }
     } else {
         const aliveCars = st.cars.filter(c => c.alive);
         const aliveHumans = st.cars.filter(c => !c.isAI && c.alive);
@@ -1775,7 +2336,7 @@ function simulateRoomStep(room) {
 function updateServerCar(room, car) {
     const st = room.state;
     if (!car.alive) {
-        if ((st.mode === 'DM' || st.mode === 'CTF') && car.respawnTimer > 0) {
+        if ((st.mode === 'DM' || st.mode === 'DM_2V2' || st.mode === 'CTF') && car.respawnTimer > 0) {
             car.respawnTimer--;
             if (car.respawnTimer <= 0) {
                 car.hp = car.maxHp;
@@ -1833,9 +2394,9 @@ function updateServerCar(room, car) {
         if (car.healOverTimeTick >= 60) {
             car.healOverTimeTick = 0;
             car.hp = Math.min(car.maxHp, car.hp + 10);
-            if (car.hasAwakening && car.carType === 1 && st.mode === 'CTF' && car.team) {
+            if (car.hasAwakening && car.carType === 1 && isServerTeamMode(st.mode) && car.team) {
                 st.cars.forEach(ally => {
-                    if (ally.uid !== car.uid && ally.alive && !ally.isReviving && ally.team === car.team) {
+                    if (ally.uid !== car.uid && ally.alive && !ally.isReviving && areServerCarsAllied(st.mode, car, ally)) {
                         ally.hp = Math.min(ally.maxHp, ally.hp + 10);
                     }
                 });
@@ -1991,7 +2552,7 @@ function updateServerCar(room, car) {
             const arcDmg = isAwkArc ? 0.35 : 0.5;
             st.cars.forEach(c => {
                 if (c.uid !== car.uid && c.alive && !c.isReviving && Math.hypot(c.x - car.x, c.y - car.y) < arcRadius) {
-                    if (st.mode === 'CTF' && c.team === car.team) return;
+                    if (areServerCarsAllied(st.mode, car, c)) return;
                     damageServerCar(room, c, arcDmg, car);
                 }
             });
@@ -2008,7 +2569,7 @@ function updateServerCar(room, car) {
         const tipY = car.y + Math.sin(car.angle) * 34;
         st.cars.forEach(c => {
             if (c.uid !== car.uid && c.alive && !c.isReviving) {
-                if (st.mode === 'CTF' && c.team === car.team) return;
+                if (areServerCarsAllied(st.mode, car, c)) return;
                 if (Math.hypot(c.x - tipX, c.y - tipY) < 46) {
                     if (!car.drillHitUids) car.drillHitUids = [];
                     if (!car.drillHitUids.includes(c.uid)) {
@@ -2073,7 +2634,7 @@ function updateServerCar(room, car) {
         }
     }
 
-    if (st.mode === 'BR' && Math.hypot(st.zone.x - car.x, st.zone.y - car.y) > st.zone.radius) {
+    if ((st.mode === 'BR' || st.mode === 'BR_DUO') && Math.hypot(st.zone.x - car.x, st.zone.y - car.y) > st.zone.radius) {
         damageServerCar(room, car, 0.2, null);
     }
 }
@@ -2083,7 +2644,7 @@ function updateServerBotAI(st, car) {
     let closest = null, minDist = Infinity;
     st.cars.forEach(c => {
         if (c.uid !== car.uid && c.alive && !c.isReviving) {
-            if (st.mode === 'CTF' && c.team === car.team) return;
+            if (areServerCarsAllied(st.mode, car, c)) return;
             const d = Math.hypot(c.x - car.x, c.y - car.y);
             if (d < minDist) { minDist = d; closest = c; }
         }
@@ -2098,7 +2659,7 @@ function updateServerBotAI(st, car) {
 
     const distToCenter = Math.hypot(st.zone.x - car.x, st.zone.y - car.y);
 
-    if (st.mode === 'BR' && distToCenter > st.zone.radius - 150) {
+    if ((st.mode === 'BR' || st.mode === 'BR_DUO') && distToCenter > st.zone.radius - 150) {
         turnTowards(Math.atan2(st.zone.y - car.y, st.zone.x - car.x), 0.08);
         car.speed = car.maxSpeed * 0.8;
     } else if (st.mode === 'CTF') {
@@ -2176,7 +2737,7 @@ function createServerBullet(st, car, angOffset, isHeart = false, customDmg = nul
         let closest = null, minDist = Infinity;
         st.cars.forEach(c => {
             if (c.uid !== car.uid && c.alive && !c.isReviving) {
-                if (st.mode === 'CTF' && c.team === car.team) return;
+                if (areServerCarsAllied(st.mode, car, c)) return;
                 const d = Math.hypot(c.x - car.x, c.y - car.y);
                 if (d < minDist) { minDist = d; closest = c; }
             }
@@ -2354,9 +2915,10 @@ function serverCarSecondaryAbility(st, car) {
 function damageServerCar(room, car, amt, attacker) {
     const st = room.state;
     if (car.isReviving || !car.alive) return;
+    if (attacker && attacker.uid !== car.uid && areServerCarsAllied(st.mode, attacker, car)) return;
     const finalAmt = (carHasTrait(car, 5) && car.abilActive > 0) ? amt * 2 : amt;
 
-    if (attacker && attacker.uid !== car.uid && (st.mode !== 'CTF' || attacker.team !== car.team)) {
+    if (attacker && attacker.uid !== car.uid && !areServerCarsAllied(st.mode, attacker, car)) {
         attacker.dmgDealt = (attacker.dmgDealt || 0) + Math.min(car.hp + car.shield, finalAmt);
     }
 
@@ -2383,14 +2945,27 @@ function damageServerCar(room, car, amt, attacker) {
         car.alive = false;
         car.hasFlag = null;
         clearServerMindControlLinks(st, car);
-        if (st.mode === 'DM' || st.mode === 'CTF') {
+        if (st.mode === 'DM' || st.mode === 'DM_2V2' || st.mode === 'CTF') {
             car.respawnTimer = 180;
+        } else if (st.mode === 'BR_DUO') {
+            const teamHasAliveMember = car.team && st.cars.some(c => c.team === car.team && c.alive);
+            if (!teamHasAliveMember && car.team) {
+                const aliveTeams = new Set(st.cars.filter(c => c.alive && c.team).map(c => c.team));
+                const teamRank = aliveTeams.size + 1;
+                st.cars.forEach(c => {
+                    if (c.team === car.team) c.rank = teamRank;
+                });
+            }
         } else {
             car.rank = st.cars.filter(c => c.alive).length + 1;
         }
 
-        if (attacker && attacker.uid !== car.uid && (st.mode !== 'CTF' || attacker.team !== car.team)) {
+        if (attacker && attacker.uid !== car.uid && !areServerCarsAllied(st.mode, attacker, car)) {
             attacker.kills = (attacker.kills || 0) + 1;
+            if (st.mode === 'DM_2V2') {
+                if (attacker.team === 'red') st.redScore = (st.redScore || 0) + 1;
+                else if (attacker.team === 'blue') st.blueScore = (st.blueScore || 0) + 1;
+            }
             if (attacker.soulReapTimer > 0 && attacker.alive) {
                 attacker.soulReapTimer = 0;
                 if (attacker.hp >= attacker.maxHp - 0.5) {
